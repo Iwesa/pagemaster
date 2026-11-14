@@ -1,8 +1,5 @@
 # Pagemaster
 
-**Kiroween 2026 Submission — Category: Resurrection**  
-**Demo Video:** [Watch the 3-minute walkthrough on YouTube](#) *(replace with your YouTube URL)*
-
 Two-way incident response over SMS, reviving 1990s Motorola Advisor paging for modern cloud DevOps. A monitoring alert comes in, an agent triages it using read-only Model Context Protocol (MCP) telemetry, and a sanitized pager message of at most 160 ASCII characters goes to the on-call engineer. Nothing touches infrastructure until the engineer replies `<TOKEN>-1` or `<TOKEN>-2`. A deterministic Tripwire check then validates the target host and approved runbook before remediation runs.
 
 ## How It Works
