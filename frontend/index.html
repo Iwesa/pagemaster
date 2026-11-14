@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pagemaster Advisor</title>
+<style>
+  :root { --lcd-bg:#b5c29a; --lcd-ink:#1f2a17; --lcd-dim:#8f9d77; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#2b2b2b; font-family:"Courier New",monospace; padding:16px; }
+  .pager { width:340px; padding:22px 20px 26px; border-radius:26px 26px 40px 40px;
+           background:linear-gradient(160deg,#3a3d42,#1c1e21); border:2px solid #0d0e10;
+           box-shadow:0 10px 30px rgba(0,0,0,.7), inset 0 2px 2px rgba(255,255,255,.15); }
+  .brand { display:flex; justify-content:space-between; color:#d7d7d7; font:bold 13px Arial,sans-serif;
+           letter-spacing:2px; margin-bottom:10px; }
+  .brand span:last-child { color:#9aa; font-weight:normal; letter-spacing:1px; }
+  .lcd { background:var(--lcd-bg); color:var(--lcd-ink); border:4px solid #0d0e10; border-radius:6px;
+         padding:8px 10px; box-shadow:inset 0 0 12px rgba(0,0,0,.45); min-height:196px; }
+  .status { display:flex; justify-content:space-between; font-size:11px; border-bottom:1px solid var(--lcd-dim);
+            padding-bottom:3px; margin-bottom:6px; }
+  .msg { font-size:15px; line-height:1.25; white-space:pre-wrap; word-break:break-all; min-height:96px;
+         text-transform:uppercase; }
+  .count { font-size:11px; text-align:right; color:#3d4a2d; }
+  .list { margin-top:6px; border-top:1px solid var(--lcd-dim); padding-top:4px; font-size:12px; }
+  .list div { display:flex; justify-content:space-between; }
+  .buttons { display:flex; gap:10px; margin-top:16px; }
+  button { font:bold 12px Arial,sans-serif; letter-spacing:1px; cursor:pointer; color:#e8e8e8;
+           background:linear-gradient(#5a5e64,#33363a); border:1px solid #000; border-radius:14px;
+           padding:9px 6px; flex:1; box-shadow:0 3px 0 #0b0c0d; }
+  button:active { transform:translateY(2px); box-shadow:0 1px 0 #0b0c0d; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .reply button { background:linear-gradient(#6a7a4a,#3d4a2d); }
+  .label { color:#9aa; font:11px Arial,sans-serif; margin:14px 0 4px; letter-spacing:1px; }
+  .bezel { display:flex; align-items:center; gap:10px; margin-top:12px; }
+  .bezel button { flex:0 0 76px; padding:6px; }
+  .page { color:#9aa; font:11px Arial,sans-serif; letter-spacing:1px; }
+  .secret { width:100%; padding:6px; border-radius:6px; border:1px solid #000; background:#d7d7d7;
+            font:12px "Courier New",monospace; }
+  .blink { animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+</style>
+</head>
+<body>
+<!-- When ALERT_WEBHOOK_SECRET is set on the server, enter it in the password field below.
+     It is kept in the input element only (never stored) and sent as "Authorization: Bearer <secret>"
+     with the simulated alert buttons. Without it those buttons get 401. -->
+<main class="pager">
+  <div class="brand"><span>MOTOROLA</span><span>ADVISOR</span></div>
+  <section class="lcd" aria-live="polite">
+    <div class="status"><span id="conn">LINK ...</span><span id="clock">--:--:--</span></div>
+    <div class="msg" id="msg">NO MESSAGES</div>
+    <div class="count" id="count"></div>
+    <div class="list" id="list"></div>
+  </section>
+
+  <div class="bezel">
+    <button id="next" type="button" disabled>NEXT</button>
+    <span class="page" id="page">0/0</span>
+  </div>
+
+  <div class="label">ALERT SECRET (ONLY IF ALERT_WEBHOOK_SECRET IS SET)</div>
+  <input class="secret" id="secret" type="password" autocomplete="off" placeholder="bearer secret (memory only)">
+
+  <div class="label">SIMULATE ALERT</div>
+  <div class="buttons" id="alerts"></div>
+
+  <div class="label">REPLY TO SELECTED PAGE</div>
+  <div class="buttons reply">
+    <button id="r1" type="button" disabled>-1</button>
+    <button id="r2" type="button" disabled>-2</button>
+  </div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var POLL_MS = 2000;
+  var ALERTS = [
+    { label: "AUTH-DB", service_name: "auth-db", error_code: "DB_POOL_EXHAUSTED" },
+    { label: "PAY-GW", service_name: "payment-gateway", error_code: "UPSTREAM_TIMEOUT" },
+    { label: "LEDGER", service_name: "ledger-worker", error_code: "DLQ_BACKLOG" }
+  ];
+  var TOKEN_RE = /^[A-Z0-9]{2}$/;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var conn = $("conn"), clock = $("clock"), msg = $("msg"), count = $("count"), list = $("list");
+  var r1 = $("r1"), r2 = $("r2"), nextBtn = $("next"), pageEl = $("page"), secretEl = $("secret");
+  var awaiting = [];          // AWAITING_APPROVAL incidents, as returned by the API
+  var selectedToken = null;   // stays stable across polls while still awaiting
+  var lastOutbox = [];
+  var lastIncidents = [];
+  var awaitingToken = null;
+  var demoEnabled = true;
+
+  function setText(el, text) { el.textContent = text; }
+
+  function api(method, path, body, extraHeaders) {
+    var opts = { method: method, headers: extraHeaders || {} };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(path, opts).then(function (res) {
+      if (!res.ok) { var e = new Error("HTTP " + res.status); e.status = res.status; throw e; }
+      return res.json();
+    });
+  }
+
+  function selectedIndex() {
+    for (var i = 0; i < awaiting.length; i++) {
+      if (awaiting[i].token === selectedToken) { return i; }
+    }
+    return -1;
+  }
+
+  // Outbox text for a token: newest message starting with "INC-<TOKEN>" (then space or end).
+  function messageFor(token) {
+    var prefix = "INC-" + token;
+    for (var i = 0; i < lastOutbox.length; i++) {
+      var t = String(lastOutbox[i].text);
+      if (t === prefix || t.indexOf(prefix + " ") === 0) { return t; }
+    }
+    return null;
+  }
+
+  function renderPager() {
+    var idx = selectedIndex();
+    awaitingToken = idx >= 0 ? awaiting[idx].token : null;
+    setText(pageEl, awaiting.length === 0 ? "0/0" : (idx + 1) + "/" + awaiting.length);
+    nextBtn.disabled = awaiting.length < 2;
+
+    var canReply = demoEnabled && awaitingToken !== null;
+    r1.disabled = r2.disabled = !canReply;
+    setText(r1, awaitingToken ? awaitingToken + "-1" : "-1");
+    setText(r2, awaitingToken ? awaitingToken + "-2" : "-2");
+
+    if (!demoEnabled) {
+      setText(msg, lastIncidents.length === 0 ? "NO MESSAGES" : "LIVE MODE: PAGES SENT BY SMS");
+      setText(count, "");
+      return;
+    }
+    var text = null;
+    if (awaitingToken !== null) { text = messageFor(awaitingToken); }
+    if (text === null && awaitingToken === null && lastOutbox.length > 0) { text = String(lastOutbox[0].text); }
+    if (text === null) { setText(msg, awaitingToken !== null ? "NO PAGE FOR INC-" + awaitingToken : "NO MESSAGES"); setText(count, ""); return; }
+    setText(msg, text);
+    setText(count, text.length + "/160");
+  }
+
+  function renderIncidents(incidents) {
+    lastIncidents = incidents;
+    list.textContent = "";
+    incidents.slice(0, 4).forEach(function (inc) {
+      var row = document.createElement("div");
+      var left = document.createElement("span");
+      var right = document.createElement("span");
+      setText(left, "INC-" + inc.token + " " + inc.service_name);
+      setText(right, String(inc.state).replace("_", " "));
+      row.appendChild(left);
+      row.appendChild(right);
+      list.appendChild(row);
+    });
+    awaiting = incidents.filter(function (inc) {
+      return inc.state === "AWAITING_APPROVAL" && TOKEN_RE.test(inc.token);
+    });
+    if (selectedIndex() < 0) { selectedToken = awaiting.length > 0 ? awaiting[0].token : null; }
+  }
+
+  function authHeaders() {
+    var s = secretEl.value;
+    return s ? { "Authorization": "Bearer " + s } : {};
+  }
+  function poll() {
+    var incidentsP = api("GET", "/api/incidents");
+    var outboxP = api("GET", "/api/demo/outbox?limit=100").catch(function (e) {
+      if (e.status === 404) { demoEnabled = false; return null; }
+      throw e;
+    });
+    Promise.all([incidentsP, outboxP]).then(function (res) {
+      setText(conn, "LINK OK");
+      renderIncidents(res[0]);
+      lastOutbox = res[1] !== null ? res[1] : [];
+      renderPager();
+    }).catch(function () {
+      setText(conn, "NO LINK");
+    });
+  }
+
+  function trigger(alert) {
+    api("POST", "/webhooks/alerts", {
+      service_name: alert.service_name,
+      error_code: alert.error_code,
+      summary: "Simulated alert from pager UI"
+    }, authHeaders()).then(poll).catch(function (e) { setText(conn, e.status === 401 ? "NEED SECRET" : "SEND FAIL"); });
+  }
+
+  function reply(choice) {
+    if (!awaitingToken) { return; }
+    r1.disabled = r2.disabled = true;
+    api("POST", "/api/demo/reply", { token: awaitingToken, choice: choice })
+      .then(function () { setTimeout(poll, 300); })
+      .catch(function () { setText(conn, "SEND FAIL"); });
+  }
+
+  var alertsEl = $("alerts");
+  ALERTS.forEach(function (a) {
+    var b = document.createElement("button");
+    b.type = "button";
+    setText(b, a.label);
+    b.addEventListener("click", function () { trigger(a); });
+    alertsEl.appendChild(b);
+  });
+  nextBtn.addEventListener("click", function () {
+    if (awaiting.length < 2) { return; }
+    selectedToken = awaiting[(selectedIndex() + 1) % awaiting.length].token;
+    renderPager();
+  });
+  r1.addEventListener("click", function () { reply(1); });
+  r2.addEventListener("click", function () { reply(2); });
+
+  setInterval(function () { setText(clock, new Date().toTimeString().slice(0, 8)); }, 1000);
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

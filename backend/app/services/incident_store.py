@@ -1,0 +1,274 @@
+"""Incident repository and audit store ports with in-memory implementations.
+
+These are the persistence ports used by the HTTP layer. ``USE_IN_MEMORY=true``
+wires the in-memory versions (no Postgres/Redis); production wires the
+asyncpg-backed versions in :mod:`backend.app.services.postgres_store`.
+
+Audit chains
+------------
+``AuditStore.commit`` implements ``AuditPort`` for the graph. Both the graph and
+the HTTP layer (dedup occurrences, security violations) append to the same
+incident, so the store is the single authority on chain order: it **re-chains**
+every appended event onto the stored head (``seq``, ``prev_hash`` and ``hash``
+are recomputed). The stored chain therefore always passes ``verify_chain``,
+even when two writers interleave.
+
+Requirements: 1.1, 1.2, 4.2, 4.3, 4.5.
+"""
+
+from __future__ import annotations
+
+import secrets
+import string
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any, Final, Literal, Protocol, runtime_checkable
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from backend.app.services.guardrails import (
+    GENESIS_HASH,
+    AuditRecord,
+    ResolutionGates,
+    can_resolve,
+    compute_audit_hash,
+)
+
+IncidentStatus = Literal[
+    "TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED"
+]
+
+ACTIVE_STATUSES: Final[frozenset[str]] = frozenset({"TRIAGING", "AWAITING_APPROVAL", "EXECUTING"})
+TERMINAL_STATUSES: Final[frozenset[str]] = frozenset({"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED"})
+ALL_STATUSES: Final[frozenset[str]] = ACTIVE_STATUSES | TERMINAL_STATUSES
+
+#: Pseudo-incident that owns audit events with no incident (e.g. forged webhooks).
+SYSTEM_INCIDENT_ID: Final[UUID] = UUID(int=0)
+
+_TOKEN_ALPHABET: Final[str] = string.ascii_uppercase + string.digits
+
+
+def generate_token() -> str:
+    """Return a random 2-character uppercase alphanumeric token."""
+    return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(2))
+
+
+class TokenCollisionError(Exception):
+    """The token is already used by an active incident."""
+
+
+class ActiveFingerprintError(Exception):
+    """An active incident already exists for the ``(service_name, error_code)`` fingerprint."""
+
+    def __init__(self, incident_id: UUID) -> None:
+        super().__init__(f"active incident {incident_id} holds this fingerprint")
+        self.incident_id = incident_id
+
+
+class IncidentRecord(BaseModel):
+    """One row of ``incidents``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    incident_id: UUID
+    token: str = Field(pattern=r"^[A-Z0-9]{2}$")
+    service_name: str
+    error_code: str
+    state: IncidentStatus = "TRIAGING"
+    raw_alert: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+@runtime_checkable
+class IncidentRepository(Protocol):
+    """Port for incident persistence."""
+
+    async def create(
+        self,
+        *,
+        incident_id: UUID,
+        token: str,
+        service_name: str,
+        error_code: str,
+        raw_alert: Mapping[str, Any],
+    ) -> IncidentRecord:
+        """Insert a ``TRIAGING`` incident.
+
+        Raises ``TokenCollisionError`` or ``ActiveFingerprintError`` on conflict.
+        """
+        ...
+
+    async def get(self, incident_id: UUID) -> IncidentRecord | None: ...
+
+    async def get_active_by_token(self, token: str) -> IncidentRecord | None:
+        """The active (non-terminal) incident holding ``token``, if any."""
+        ...
+
+    async def list_recent(self, limit: int = 100) -> list[IncidentRecord]:
+        """Newest first. Excludes the system pseudo-incident."""
+        ...
+
+    async def set_state(self, incident_id: UUID, new: IncidentStatus) -> bool:
+        """Unconditionally set the state. False if the incident does not exist."""
+        ...
+
+    async def compare_and_set_state(
+        self, incident_id: UUID, expected: IncidentStatus, new: IncidentStatus
+    ) -> bool:
+        """Atomically move ``expected`` -> ``new``. False if the state differed."""
+        ...
+
+    async def record_resolution(
+        self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None
+    ) -> bool:
+        """Persist ``status`` and the four gate flags in one atomic write.
+
+        ``None`` flags keep the stored value. ``RESOLVED`` is only accepted when
+        every flag is true (``ValueError`` in memory, ``CheckViolationError`` in
+        Postgres). False if the incident does not exist.
+        """
+        ...
+
+
+@runtime_checkable
+class AuditStore(Protocol):
+    """Port for the append-only, hash-chained audit trail. Also satisfies ``AuditPort``."""
+
+    async def commit(self, record: AuditRecord) -> None:
+        """``AuditPort``: persist the event carried by ``record`` (re-chained onto the head)."""
+        ...
+
+    async def append_event(
+        self, incident_id: UUID, event_type: str, payload: Mapping[str, Any] | None = None
+    ) -> AuditRecord | None:
+        """Append one event. Returns ``None`` if the incident does not exist."""
+        ...
+
+    async def records(self, incident_id: UUID) -> list[AuditRecord]:
+        """The incident's chain ordered by ``seq`` (empty if none)."""
+        ...
+
+
+def rechain(
+    chain: list[AuditRecord], incident_id: UUID, event_type: str, payload: Mapping[str, Any]
+) -> AuditRecord:
+    """Build the next record for ``chain`` (does not mutate it)."""
+    prev = chain[-1].hash if chain else GENESIS_HASH
+    seq = len(chain)
+    body: dict[str, Any] = dict(payload)
+    return AuditRecord(
+        incident_id=incident_id,
+        seq=seq,
+        event_type=event_type,
+        payload=body,
+        prev_hash=prev,
+        hash=compute_audit_hash(prev, incident_id, seq, event_type, body),
+    )
+
+
+class InMemoryIncidentRepository:
+    """Single-process repository enforcing the same uniqueness rules as the SQL indexes."""
+
+    def __init__(self) -> None:
+        self._rows: dict[UUID, IncidentRecord] = {}
+        self._gates: dict[UUID, dict[str, bool | None]] = {}
+
+    async def create(
+        self,
+        *,
+        incident_id: UUID,
+        token: str,
+        service_name: str,
+        error_code: str,
+        raw_alert: Mapping[str, Any],
+    ) -> IncidentRecord:
+        for row in self._rows.values():
+            if row.state not in ACTIVE_STATUSES:
+                continue
+            if row.token == token:
+                raise TokenCollisionError(token)
+            if row.service_name == service_name and row.error_code == error_code:
+                raise ActiveFingerprintError(row.incident_id)
+        record = IncidentRecord(
+            incident_id=incident_id,
+            token=token,
+            service_name=service_name,
+            error_code=error_code,
+            raw_alert=dict(raw_alert),
+        )
+        self._rows[incident_id] = record
+        return record
+
+    async def get(self, incident_id: UUID) -> IncidentRecord | None:
+        return self._rows.get(incident_id)
+
+    async def get_active_by_token(self, token: str) -> IncidentRecord | None:
+        for row in self._rows.values():
+            if row.token == token and row.state in ACTIVE_STATUSES:
+                return row
+        return None
+
+    async def list_recent(self, limit: int = 100) -> list[IncidentRecord]:
+        rows = sorted(self._rows.values(), key=lambda r: r.created_at, reverse=True)
+        return rows[:limit]
+
+    async def set_state(self, incident_id: UUID, new: IncidentStatus) -> bool:
+        row = self._rows.get(incident_id)
+        if row is None:
+            return False
+        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": datetime.now(UTC)})
+        return True
+
+    async def compare_and_set_state(
+        self, incident_id: UUID, expected: IncidentStatus, new: IncidentStatus
+    ) -> bool:
+        # No await between check and write: atomic on the event loop.
+        row = self._rows.get(incident_id)
+        if row is None or row.state != expected:
+            return False
+        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": datetime.now(UTC)})
+        return True
+
+
+    async def record_resolution(
+        self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None
+    ) -> bool:
+        row = self._rows.get(incident_id)
+        if row is None:
+            return False
+        merged = {
+            name: (new if new is not None else self._gates.get(incident_id, {}).get(name))
+            for name, new in (gates or ResolutionGates()).model_dump().items()
+        }
+        if status == "RESOLVED" and not can_resolve(ResolutionGates.model_validate(merged)):
+            raise ValueError("RESOLVED requires all four resolution gates to be true")
+        self._gates[incident_id] = merged
+        self._rows[incident_id] = row.model_copy(update={"state": status, "updated_at": datetime.now(UTC)})
+        return True
+
+
+class InMemoryAuditStore:
+    """Single-process audit store. ``known`` incidents are looked up in ``repository``."""
+
+    def __init__(self, repository: IncidentRepository | None = None) -> None:
+        self._repository = repository
+        self._chains: dict[UUID, list[AuditRecord]] = {}
+
+    async def commit(self, record: AuditRecord) -> None:
+        await self.append_event(record.incident_id, record.event_type, record.payload)
+
+    async def append_event(
+        self, incident_id: UUID, event_type: str, payload: Mapping[str, Any] | None = None
+    ) -> AuditRecord | None:
+        if incident_id != SYSTEM_INCIDENT_ID and self._repository is not None:
+            if await self._repository.get(incident_id) is None:
+                return None
+        chain = self._chains.setdefault(incident_id, [])
+        record = rechain(chain, incident_id, event_type, payload or {})
+        chain.append(record)
+        return record
+
+    async def records(self, incident_id: UUID) -> list[AuditRecord]:
+        return list(self._chains.get(incident_id, ()))

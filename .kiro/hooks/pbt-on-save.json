@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Run Hypothesis PBT on Agent or Formatter Change",
+      "description": "Automatically runs property-based tests whenever agent, MCP, or pager formatting code is saved.",
+      "trigger": "PostFileSave",
+      "matcher": "backend/app/(agents|mcp|services)/.*\\.py$",
+      "action": {
+        "type": "command",
+        "command": "pytest backend/tests/test_properties.py -v --tb=short"
+      }
+    }
+  ]
+}

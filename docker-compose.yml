@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pagemaster
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pagemaster_dev}
+      POSTGRES_DB: pagemaster
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init_mock_logs.sql:/docker-entrypoint-initdb.d/01_init_mock_logs.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pagemaster -d pagemaster"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://pagemaster:${POSTGRES_PASSWORD:-pagemaster_dev}@postgres:5432/pagemaster
+      MCP_READER_DATABASE_URL: postgresql://mcp_reader:${MCP_READER_PASSWORD:-mcp_reader_dev}@postgres:5432/pagemaster
+      REDIS_URL: redis://redis:6379/0
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-stdio}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      USE_IN_MEMORY: ${USE_IN_MEMORY:-false}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      ALERT_WEBHOOK_SECRET: ${ALERT_WEBHOOK_SECRET:-}
+      DRY_RUN: ${DRY_RUN:-true}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      ONCALL_PHONE_NUMBER: ${ONCALL_PHONE_NUMBER:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

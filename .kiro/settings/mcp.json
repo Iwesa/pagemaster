@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pagemaster-telemetry": {
+      "command": "python",
+      "args": ["-m", "backend.app.mcp.server"],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}"
+      },
+      "disabled": false
+    }
+  }
+}

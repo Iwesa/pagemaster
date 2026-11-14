@@ -1,0 +1,268 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1.1 Create `docker-compose.yml`, `backend/Dockerfile`, `backend/requirements.txt` (`fastapi`, `uvicorn`, `langgraph`, `langgraph-checkpoint-postgres`, `mcp`, `asyncpg`, `redis`, `twilio`, `pydantic`, `pytest`, `hypothesis`), and `LICENSE` (MIT).": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641725255
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641760340
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641849527
+      }
+    ],
+    "1.2 Create `database/init_mock_logs.sql` defining tables (`incidents`, `service_logs`, `approved_runbooks`, `audit_trail`), read-only views (`v_recent_logs`, `v_service_topology`, `v_approved_runbooks`), a restricted `mcp_reader` DB role, and realistic seed incident logs for `auth-db`, `payment-gateway`, and `ledger-worker`.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641725690
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641854267
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641947700
+      }
+    ],
+    "2.1 Implement `backend/app/mcp/server.py` using `FastMCP` exposing `get_incident_context(service_name)` over a read-only `asyncpg` pool with a 5-second timeout and graceful fallback.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641727335
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641953493
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642106632
+      }
+    ],
+    "2.2 Implement `backend/app/services/guardrails.py` containing `sanitize_pager_text`, `format_pager_payload` (enforcing `<= 160` ASCII chars), `parse_sms_reply`, `TripwireValidator`, and SHA-256 hash-chained `AuditLogger`.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641727845
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642114570
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642304967
+      }
+    ],
+    "3.1 Implement `backend/app/agents/graph.py` defining `IncidentState`, `triage_worker`, `supervisor_formatter`, `human_approval_gate` (using `langgraph.types.interrupt`), `tripwire_guard`, and `remediation_executor` compiled with `AsyncPostgresSaver`.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641728281
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642314053
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642793432
+      }
+    ],
+    "4.1 Implement `backend/app/services/dedup.py` using Redis `SET ... NX EX 300` for atomic incident fingerprinting and `backend/app/services/twilio_client.py` supporting both live Twilio dispatch and `DRY_RUN` mode.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641728622
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642801120
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643115142
+      }
+    ],
+    "4.2 Implement `backend/app/main.py` and `backend/app/api/routes.py` with `POST /webhooks/alerts`, `POST /webhooks/twilio/sms` (with `RequestValidator` signature verification), `GET /api/incidents`, and `GET /api/incidents/{id}/audit`.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641729062
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643116246
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643694438
+      }
+    ],
+    "5.1 Create `frontend/index.html` styled as a 1990s Motorola Advisor two-way pager with live incident polling, simulated alert triggers, and one-click SMS reply buttons (`<TOKEN>-1` / `<TOKEN>-2`) for demo resilience.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641729404
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643695822
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643979840
+      }
+    ],
+    "5.2 Implement `backend/tests/test_properties.py` covering Properties 1–5 using `hypothesis` (`@settings(max_examples=200)`) and integration tests in `backend/tests/test_workflow.py` verifying end-to-end deduplication, HITL interrupt/resume, and Tripwire blocking.": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641729972
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643981495
+      },
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794644744846
+      }
+    ],
+    "1. Initialize repository structure, Docker stack, and PostgreSQL schema": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794641948266
+      }
+    ],
+    "2. Build read-only FastMCP telemetry server and deterministic guardrails": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642305447
+      }
+    ],
+    "3. Implement LangGraph supervisor-worker state machine with Postgres HITL checkpointing": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794642795269
+      }
+    ],
+    "4. Build FastAPI webhook gateway, Redis deduplication, and Twilio SMS adapter": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794643694976
+      }
+    ],
+    "5. Build Retro LCD Pager Simulator UI and Property-Based Test Suite": [
+      {
+        "executionId": "f065c0bf-1487-4c3e-b40a-2b5f4f44238b",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794644746029
+      }
+    ],
+    "6.1 Fix PostgreSQL persistence and incident lifecycle: add `IncidentRepository.record_resolution(incident_id, status, gates)` (in-memory and `postgres_store.py`) that persists the four `ResolutionGates` flags atomically with the state so `resolved_requires_all_gates` holds; use it from `_run_workflow` in `routes.py`. Add `FAILED` to `IncidentStatus` and `TERMINAL_STATUSES`, exclude it from `uq_incidents_active_fingerprint`, move failed runs (executor gate failure, unhandled `_run_workflow` exception) to `FAILED`, and release the Redis lock. Change `database/init_mock_logs.sql` to seed only terminal incidents (`RESOLVED`, `BLOCKED_BY_TRIPWIRE`). Add a Postgres integration test file that is skipped when no `TEST_DATABASE_URL` is set.": [
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794645674720
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794645682395
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794646444134
+      }
+    ],
+    "6.2 Harden `guardrails.py`: replace the loose IPv6 regex with candidate extraction validated by `ipaddress.ip_address()` so timestamps such as `12:30:45` survive, and make `jsonb_text` handle floats (normalize to Decimal strings matching Postgres jsonb output) instead of raising `TypeError`. Add property tests.": [
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794645675349
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794645683767
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794646444974
+      }
+    ],
+    "6.3 Make triage use real MCP and wire the summarizer: `mcp/server.py` reads `MCP_READER_DATABASE_URL` before `DATABASE_URL`; add an `McpSubprocessTelemetry` adapter (`mcp.client.stdio.stdio_client` and `ClientSession` spawning `python -m backend.app.mcp.server`) used by `build_real_services`; add an `LlmSummarizer` adapter (Gemini or OpenAI when an API key is set, clean fallback otherwise) wired into `Ports`, with output still clamped by `format_pager_payload`.": [
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794645675754
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794646458230
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794646982130
+      }
+    ],
+    "6.4 API, compose and UI hardening: optional `ALERT_WEBHOOK_SECRET` bearer check on `POST /webhooks/alerts`; expose `PUBLIC_BASE_URL`, `USE_IN_MEMORY`, `ALERT_WEBHOOK_SECRET` in `docker-compose.yml`; add a NEXT button to `frontend/index.html` that cycles through `AWAITING_APPROVAL` incidents and binds `-1`/`-2` to the selected page; add a `.gitignore` covering `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.hypothesis/`; run `pytest backend/tests/ -v` and `mypy --strict backend/app` and fix failures.": [
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794645675984
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794646982871
+      },
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794647275012
+      }
+    ],
+    "6. Post-review hardening": [
+      {
+        "executionId": "719bc84f-60c7-49bd-8fb7-ca5303b47029",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794647275462
+      }
+    ]
+  }
+}
