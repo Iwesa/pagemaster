@@ -1,1 +1,1 @@
-"""Pure domain services (no FastAPI / Twilio imports)."""
+"""Pure domain services (no FastAPI / SMS-gateway imports)."""

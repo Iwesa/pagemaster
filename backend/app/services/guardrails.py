@@ -145,23 +145,129 @@ class ClampReason(StrEnum):
 
     REDACTED = "REDACTED"
     NON_ASCII = "NON_ASCII"
+    TRANSLITERATED = "TRANSLITERATED"
     TRUNCATED = "TRUNCATED"
 
 
-def _ascii_clean(text: str) -> tuple[str, bool]:
-    """Replace non-ASCII with '?', control characters with spaces, collapse spaces."""
-    changed = False
+# ---------------------------------------------------------------------------
+# GSM 03.38 (GSM-7) septet accounting and UCS-2 prevention (Req 3.1)
+# ---------------------------------------------------------------------------
+
+# Default alphabet (1 septet each). The ESC slot (0x1B) is not a character.
+_GSM7_BASIC: Final[frozenset[str]] = frozenset(
+    "@\u00a3$\u00a5\u00e8\u00e9\u00f9\u00ec\u00f2\u00c7\n\u00d8\u00f8\r\u00c5\u00e5"
+    "\u0394_\u03a6\u0393\u039b\u03a9\u03a0\u03a8\u03a3\u0398\u039e"
+    "\u00c6\u00e6\u00df\u00c9 !\"#\u00a4%&'()*+,-./0123456789:;<=>?"
+    "\u00a1ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c4\u00d6\u00d1\u00dc\u00a7"
+    "\u00bfabcdefghijklmnopqrstuvwxyz\u00e4\u00f6\u00f1\u00fc\u00e0"
+)
+# Extension table (ESC + char = 2 septets).
+_GSM7_EXTENSION: Final[frozenset[str]] = frozenset("\f^{}\\[~]|\u20ac")
+
+_TRANSLITERATIONS: Final[Mapping[str, str]] = {
+    "`": "'",
+    "\u00b4": "'",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": ",",
+    "\u201b": "'",
+    "\u2032": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+    "\u2033": '"',
+    "\u00ab": '"',
+    "\u00bb": '"',
+    "\u2010": "-",
+    "\u2011": "-",
+    "\u2012": "-",
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2015": "-",
+    "\u2212": "-",
+    "\u2026": "...",
+    "\u20ac": "EUR",
+    "\u00a0": " ",
+    "\u2022": "*",
+    "\u00d7": "x",
+}
+
+
+def gsm7_septet_cost(ch: str) -> int:
+    """Septets for one character: 1 (basic) or 2 (extension).
+
+    Raises:
+        ValueError: if ``ch`` is not in the GSM 03.38 alphabets (it would force UCS-2).
+    """
+    if ch in _GSM7_BASIC:
+        return 1
+    if ch in _GSM7_EXTENSION:
+        return 2
+    raise ValueError(f"character U+{ord(ch):04X} is not encodable in GSM-7")
+
+
+def gsm7_septets(text: str) -> int:
+    """Number of GSM-7 septets needed for ``text`` (extension characters cost 2).
+
+    Raises:
+        ValueError: if any character is outside the GSM 03.38 alphabets.
+    """
+    return sum(gsm7_septet_cost(ch) for ch in text)
+
+
+def clamp_to_septets(text: str, limit: int = PAGER_MAX_CHARS) -> str:
+    """Longest prefix of ``text`` costing at most ``limit`` septets.
+
+    Never splits a 2-septet extension character: it is kept whole or dropped.
+    """
+    used = 0
+    for index, ch in enumerate(text):
+        used += gsm7_septet_cost(ch)
+        if used > limit:
+            return text[:index]
+    return text
+
+
+def transliterate_gsm7(text: str) -> tuple[str, bool, bool]:
+    """Fold ``text`` to printable ASCII that is also encodable in GSM-7.
+
+    Returns ``(text, transliterated, replaced)``: ``transliterated`` is true when
+    a known mapping applied (backtick, smart quotes/dashes, ellipsis, euro...),
+    ``replaced`` when an unmappable non-ASCII character became ``?``. Control
+    characters become spaces; whitespace is not collapsed here.
+    """
     out: list[str] = []
+    transliterated = False
+    replaced = False
     for ch in text:
+        mapped = _TRANSLITERATIONS.get(ch)
         code = ord(ch)
-        if code > 127:
+        if mapped is not None:
+            out.append(mapped)
+            transliterated = True
+        elif code > 127:
             out.append("?")
-            changed = True
+            replaced = True
         elif code < 32 or code == 127:
             out.append(" ")
         else:
             out.append(ch)
-    return _WS_RE.sub(" ", "".join(out)).strip(), changed
+    return "".join(out), transliterated, replaced
+
+
+def to_gsm7_safe(text: str) -> str:
+    """ASCII-only, GSM-7 encodable rendering of ``text`` (no UCS-2 fallback possible)."""
+    return _WS_RE.sub(" ", transliterate_gsm7(text)[0]).strip()
+
+
+def _ascii_clean(text: str) -> tuple[str, bool, bool]:
+    """Transliterate/replace non-GSM text and collapse spaces.
+
+    Returns ``(text, non_ascii_replaced, transliterated)``.
+    """
+    folded, transliterated, replaced = transliterate_gsm7(text)
+    return _WS_RE.sub(" ", folded).strip(), replaced, transliterated
 
 
 def _redact(text: str) -> tuple[str, int]:
@@ -194,13 +300,19 @@ class SanitizeResult(BaseModel):
     text: str
     redactions: int = Field(ge=0)
     non_ascii_replaced: bool
+    transliterated: bool = False
 
 
 def sanitize_with_report(text: str) -> SanitizeResult:
     """Sanitise ``text`` and report whether anything was redacted/replaced."""
-    cleaned, non_ascii = _ascii_clean(text)
+    cleaned, non_ascii, translit = _ascii_clean(text)
     redacted, count = _redact(cleaned)
-    return SanitizeResult(text=redacted, redactions=count, non_ascii_replaced=non_ascii)
+    return SanitizeResult(
+        text=redacted,
+        redactions=count,
+        non_ascii_replaced=non_ascii,
+        transliterated=translit,
+    )
 
 
 def sanitize_pager_text(text: str) -> str:
@@ -220,13 +332,14 @@ def _validate_token(token: str) -> str:
 
 
 def _truncate(text: str, limit: int) -> str:
+    """Truncate to at most ``limit`` septets, ending in ``...`` when room allows."""
     if limit <= 0:
         return ""
-    if len(text) <= limit:
+    if gsm7_septets(text) <= limit:
         return text
     if limit <= 3:
-        return text[:limit]
-    return text[: limit - 3].rstrip() + "..."
+        return clamp_to_septets(text, limit)
+    return clamp_to_septets(text, limit - 3).rstrip() + "..."
 
 
 class PagerPayload(BaseModel):
@@ -244,13 +357,64 @@ class PagerPayload(BaseModel):
         return AuditEvent.GUARDRAIL_CLAMPED if self.clamped else None
 
 
-def format_pager_payload(token: str, service_name: str, summary: str) -> PagerPayload:
-    """Build ``INC-<TOKEN> <service>: <summary> Reply <TOKEN>-1 or <TOKEN>-2``.
+TITLE_MAX_SEPTETS: Final[int] = 16
+_TITLE_CAPS: Final[tuple[int, ...]] = (TITLE_MAX_SEPTETS, 12, 8, 4)
+_MIN_SUMMARY_SEPTETS: Final[int] = 12
 
-    The result is pure ASCII, at most 160 characters, and free of emails, IP
-    addresses, bearer tokens and high-entropy secrets. ``clamped`` is true when
-    the summary/service had to be redacted, ASCII-folded or truncated, so the
-    caller can record a ``GUARDRAIL_CLAMPED`` audit event (Req 3.3).
+
+def _shorten_title(title: str, limit: int) -> str:
+    """Cap ``title`` at ``limit`` septets, preferring a word boundary."""
+    if gsm7_septets(title) <= limit:
+        return title
+    cut = clamp_to_septets(title, limit)
+    if len(cut) < len(title) and title[len(cut)] != " " and " " in cut:
+        cut = cut[: cut.rindex(" ")]
+    return cut.rstrip(" :.-")
+
+
+def short_title(
+    raw: str | None, option: int, limit: int = TITLE_MAX_SEPTETS, *, _reasons: set[ClampReason] | None = None
+) -> str:
+    """Short pager title for reply option ``option`` (1 or 2).
+
+    Runs ``raw`` through the same PII/ASCII/GSM-7 pipeline as the summary, then
+    caps it at ``limit`` septets. Falls back to ``Option <n>`` when ``raw`` is
+    missing or empty after sanitisation.
+    """
+    fallback = f"Option {option}"
+    if raw is None:
+        return _shorten_title(fallback, limit)
+    report = sanitize_with_report(raw)
+    if _reasons is not None:
+        if report.redactions:
+            _reasons.add(ClampReason.REDACTED)
+        if report.non_ascii_replaced:
+            _reasons.add(ClampReason.NON_ASCII)
+        if report.transliterated:
+            _reasons.add(ClampReason.TRANSLITERATED)
+    text = _shorten_title(report.text, limit)
+    if not text.strip("?*. -"):
+        text = fallback
+    return _shorten_title(text, limit) or fallback[:limit]
+
+
+def format_pager_payload(
+    token: str,
+    service_name: str,
+    summary: str,
+    title1: str | None = None,
+    title2: str | None = None,
+) -> PagerPayload:
+    """Build ``INC-<TOKEN> <service>: <summary>. <TOKEN>-1:<t1> <TOKEN>-2:<t2>``.
+
+    ``title1``/``title2`` are the runbook titles for options 1 and 2 (generic
+    ``Option n`` when missing). The result is pure ASCII, at most 160 GSM-7
+    septets, and free of emails, IP addresses, bearer tokens and high-entropy
+    secrets. The summary is truncated first, then the titles shrink; neither
+    reply code is ever dropped. ``clamped`` is true when the summary/service had
+    to be redacted, ASCII-folded or truncated (title shortening alone is by
+    design and does not count), so the caller can record a ``GUARDRAIL_CLAMPED``
+    audit event (Req 3.3).
 
     Raises:
         ValueError: if ``token`` is not 2 uppercase alphanumeric characters.
@@ -264,21 +428,35 @@ def format_pager_payload(token: str, service_name: str, summary: str) -> PagerPa
             reasons.add(ClampReason.REDACTED)
         if report.non_ascii_replaced:
             reasons.add(ClampReason.NON_ASCII)
+        if report.transliterated:
+            reasons.add(ClampReason.TRANSLITERATED)
         return report.text
 
     service = _clean(service_name)
-    if len(service) > _MAX_SERVICE_CHARS:
-        service = service[:_MAX_SERVICE_CHARS]
+    if len(service) > _MAX_SERVICE_CHARS or gsm7_septets(service) > _MAX_SERVICE_CHARS:
+        service = clamp_to_septets(service[:_MAX_SERVICE_CHARS], _MAX_SERVICE_CHARS)
         reasons.add(ClampReason.TRUNCATED)
     service = service.rstrip(":. ") or "unknown"
+    # The ": " separator can complete a match (e.g. "0@" + ":" -> "0@:"); redact with it.
+    contextual, count = _redact(f"{service}: ")
+    if count:
+        reasons.add(ClampReason.REDACTED)
+        service = contextual.rstrip(":. ") or "unknown"
 
     prefix = f"INC-{token} {service}: "
-    suffix = f" Reply {token}-1 or {token}-2"
-    budget = PAGER_MAX_CHARS - len(prefix) - len(suffix)
+    suffix = ""
+    budget = 0
+    for cap in _TITLE_CAPS:
+        t1 = short_title(title1, 1, cap, _reasons=reasons)
+        t2 = short_title(title2, 2, cap, _reasons=reasons)
+        suffix = f". {token}-1:{t1} {token}-2:{t2}"
+        budget = PAGER_MAX_CHARS - gsm7_septets(prefix) - gsm7_septets(suffix)
+        if budget >= _MIN_SUMMARY_SEPTETS:
+            break
 
     body = _clean(summary) or "alert"
     for _ in range(3):
-        if len(body) > budget:
+        if gsm7_septets(body) > budget:
             body = _truncate(body, budget)
             reasons.add(ClampReason.TRUNCATED)
         again, count = _redact(body)
@@ -288,9 +466,15 @@ def format_pager_payload(token: str, service_name: str, summary: str) -> PagerPa
         body = again
     else:
         body = ""
+    body = body.rstrip(". ") or "alert"
+    if _redact(f"{prefix}{body}{suffix}")[1] > 0:
+        # Joining body and suffix can form a new match (e.g. "0@" + ". 00-1" -> "0@.").
+        # Redact the body with the separator as context instead of dropping the titles.
+        body = _redact(f"{body}. ")[0].rstrip(". ") or "alert"
+        reasons.add(ClampReason.REDACTED)
 
     text = f"{prefix}{body}{suffix}"
-    if len(text) > PAGER_MAX_CHARS or not text.isascii() or _redact(text)[1] > 0:
+    if gsm7_septets(text) > PAGER_MAX_CHARS or not text.isascii() or _redact(text)[1] > 0:
         # Last-resort deterministic fallback; cannot violate the invariant.
         reasons.add(ClampReason.TRUNCATED)
         text = f"INC-{token} Reply {token}-1 or {token}-2"

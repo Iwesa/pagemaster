@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import secrets
 import string
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, Protocol, runtime_checkable
 from uuid import UUID
@@ -36,11 +36,13 @@ from backend.app.services.guardrails import (
 )
 
 IncidentStatus = Literal[
-    "TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED"
+    "TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED"
 ]
 
 ACTIVE_STATUSES: Final[frozenset[str]] = frozenset({"TRIAGING", "AWAITING_APPROVAL", "EXECUTING"})
-TERMINAL_STATUSES: Final[frozenset[str]] = frozenset({"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED"})
+TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
+    {"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED"}
+)
 ALL_STATUSES: Final[frozenset[str]] = ACTIVE_STATUSES | TERMINAL_STATUSES
 
 #: Pseudo-incident that owns audit events with no incident (e.g. forged webhooks).
@@ -120,6 +122,20 @@ class IncidentRepository(Protocol):
         """Atomically move ``expected`` -> ``new``. False if the state differed."""
         ...
 
+    async def list_by_states(
+        self,
+        states: Collection[IncidentStatus],
+        *,
+        updated_before: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[IncidentRecord]:
+        """Incidents in any of ``states`` (oldest first), optionally with ``updated_at < updated_before``.
+
+        ``updated_at`` is the time of the last state transition, so for ``AWAITING_APPROVAL``
+        it is when approval started. Excludes the system pseudo-incident.
+        """
+        ...
+
     async def record_resolution(
         self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None
     ) -> bool:
@@ -171,7 +187,8 @@ def rechain(
 class InMemoryIncidentRepository:
     """Single-process repository enforcing the same uniqueness rules as the SQL indexes."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock: Callable[[], datetime] = clock if clock is not None else (lambda: datetime.now(UTC))
         self._rows: dict[UUID, IncidentRecord] = {}
         self._gates: dict[UUID, dict[str, bool | None]] = {}
 
@@ -197,6 +214,8 @@ class InMemoryIncidentRepository:
             service_name=service_name,
             error_code=error_code,
             raw_alert=dict(raw_alert),
+            created_at=self._clock(),
+            updated_at=self._clock(),
         )
         self._rows[incident_id] = record
         return record
@@ -214,11 +233,28 @@ class InMemoryIncidentRepository:
         rows = sorted(self._rows.values(), key=lambda r: r.created_at, reverse=True)
         return rows[:limit]
 
+    async def list_by_states(
+        self,
+        states: Collection[IncidentStatus],
+        *,
+        updated_before: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[IncidentRecord]:
+        wanted = set(states)
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.state in wanted
+            and r.incident_id != SYSTEM_INCIDENT_ID
+            and (updated_before is None or r.updated_at < updated_before)
+        ]
+        return sorted(rows, key=lambda r: r.updated_at)[:limit]
+
     async def set_state(self, incident_id: UUID, new: IncidentStatus) -> bool:
         row = self._rows.get(incident_id)
         if row is None:
             return False
-        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": datetime.now(UTC)})
+        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": self._clock()})
         return True
 
     async def compare_and_set_state(
@@ -228,7 +264,7 @@ class InMemoryIncidentRepository:
         row = self._rows.get(incident_id)
         if row is None or row.state != expected:
             return False
-        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": datetime.now(UTC)})
+        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": self._clock()})
         return True
 
 
@@ -245,7 +281,7 @@ class InMemoryIncidentRepository:
         if status == "RESOLVED" and not can_resolve(ResolutionGates.model_validate(merged)):
             raise ValueError("RESOLVED requires all four resolution gates to be true")
         self._gates[incident_id] = merged
-        self._rows[incident_id] = row.model_copy(update={"state": status, "updated_at": datetime.now(UTC)})
+        self._rows[incident_id] = row.model_copy(update={"state": status, "updated_at": self._clock()})
         return True
 
 

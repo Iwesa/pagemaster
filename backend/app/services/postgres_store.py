@@ -12,7 +12,8 @@ Requirements: 1.1, 1.2, 4.2, 4.3, 4.5.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from datetime import datetime
 from typing import Any, Final, cast
 from uuid import UUID
 
@@ -48,6 +49,10 @@ _SQL_ACTIVE_BY_FINGERPRINT: Final[str] = (
 _SQL_LIST: Final[str] = (
     f"SELECT {_COLUMNS} FROM incidents WHERE incident_id <> $1 ORDER BY created_at DESC LIMIT $2"
 )
+_SQL_LIST_BY_STATES: Final[str] = (
+    f"SELECT {_COLUMNS} FROM incidents WHERE state = ANY($1::text[]) AND incident_id <> $2 "
+    "AND ($3::timestamptz IS NULL OR updated_at < $3) ORDER BY updated_at LIMIT $4"
+)
 _SQL_SET_STATE: Final[str] = "UPDATE incidents SET state = $2, updated_at = now() WHERE incident_id = $1"
 _SQL_RECORD_RESOLUTION: Final[str] = (
     "UPDATE incidents SET state = $2, "
@@ -70,9 +75,15 @@ _SQL_INSERT_AUDIT: Final[str] = (
     "VALUES ($1, $2, $3, $4::jsonb, $5, $6)"
 )
 _SQL_ENSURE_SYSTEM: Final[str] = (
-    "INSERT INTO incidents (incident_id, token, service_name, error_code, state) "
-    "VALUES ($1, '00', $2, 'SYSTEM', 'RESOLVED') ON CONFLICT (incident_id) DO NOTHING"
+    "INSERT INTO incidents (incident_id, token, service_name, error_code, state, "
+    "tripwire_check_passed, simulated_step_executed, confirmation_sms_sent, audit_record_committed) "
+    "VALUES ($1, '00', $2, 'SYSTEM', 'RESOLVED', TRUE, TRUE, TRUE, TRUE) "
+    "ON CONFLICT (incident_id) DO NOTHING"
 )
+MCP_READER_ROLE: Final[str] = "mcp_reader"
+_SQL_ROLE_EXISTS: Final[str] = "SELECT 1 FROM pg_roles WHERE rolname = $1"
+# The server quotes the secret (%L); the secret is never concatenated client-side.
+_SQL_ROLE_PASSWORD_STMT: Final[str] = "SELECT format('ALTER ROLE %I PASSWORD %L', $1::text, $2::text)"
 
 
 def _json_dict(value: object) -> dict[str, Any]:
@@ -111,6 +122,25 @@ async def ensure_system_incident(pool: asyncpg.Pool) -> None:
     """Create the sentinel incident that owns incident-less audit events."""
     async with pool.acquire() as conn:
         await conn.execute(_SQL_ENSURE_SYSTEM, SYSTEM_INCIDENT_ID, SYSTEM_SERVICE_NAME)
+
+
+async def sync_mcp_reader_password(pool: asyncpg.Pool, password: str | None) -> bool:
+    """Set the ``mcp_reader`` role password from ``MCP_READER_PASSWORD``.
+
+    Returns True when applied. Skips silently (False) if the password is unset
+    or the role does not exist. The statement is built server-side with
+    ``format(%I, %L)`` so the value is always correctly quoted.
+    """
+    if not password:
+        return False
+    async with pool.acquire() as conn:
+        if await conn.fetchval(_SQL_ROLE_EXISTS, MCP_READER_ROLE) is None:
+            return False
+        statement = await conn.fetchval(_SQL_ROLE_PASSWORD_STMT, MCP_READER_ROLE, password)
+        if not isinstance(statement, str):
+            return False
+        await conn.execute(statement)
+    return True
 
 
 class PostgresIncidentRepository:
@@ -155,6 +185,17 @@ class PostgresIncidentRepository:
     async def list_recent(self, limit: int = 100) -> list[IncidentRecord]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(_SQL_LIST, SYSTEM_INCIDENT_ID, limit)
+        return [_to_incident(r) for r in rows]
+
+    async def list_by_states(
+        self,
+        states: Collection[IncidentStatus],
+        *,
+        updated_before: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[IncidentRecord]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_LIST_BY_STATES, list(states), SYSTEM_INCIDENT_ID, updated_before, limit)
         return [_to_incident(r) for r in rows]
 
     async def set_state(self, incident_id: UUID, new: IncidentStatus) -> bool:

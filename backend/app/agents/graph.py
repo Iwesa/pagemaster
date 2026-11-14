@@ -31,6 +31,7 @@ from langgraph.types import interrupt
 
 from backend.app.agents.ports import Ports, Runbook
 from backend.app.services.guardrails import (
+    AuditEvent,
     AuditLogger,
     AuditRecord,
     ResolutionGates,
@@ -43,6 +44,8 @@ from backend.app.services.guardrails import (
 logger = logging.getLogger("pagemaster.agents.graph")
 
 TELEMETRY_TIMEOUT_SECONDS: Final[float] = 5.0
+RUNBOOK_LOOKUP_TIMEOUT_SECONDS: Final[float] = 5.0
+REASON_LOOKUP_FAILED: Final[str] = "runbook_lookup_failed"
 
 IncidentStatus = Literal["TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE"]
 Confidence = Literal["HIGH", "DEGRADED"]
@@ -138,7 +141,11 @@ def build_graph(
                 ports.telemetry.get_incident_context(service), TELEMETRY_TIMEOUT_SECONDS
             )
             confidence = ctx.confidence
-            root_cause = ctx.root_cause or root_cause
+            # DEGRADED telemetry carries no real cause: keep the alert's own summary.
+            if confidence == "HIGH":
+                root_cause = ctx.root_cause or root_cause
+            else:
+                root_cause = root_cause or ctx.root_cause
             runbooks = list(ctx.runbooks)
         except Exception:  # includes TimeoutError; Req 2.3: never crash the workflow
             logger.warning("telemetry unavailable for %s; degrading", service)
@@ -166,7 +173,14 @@ def build_graph(
                 logger.warning("summarizer failed; using deterministic summary")
         if state.get("confidence") == "DEGRADED":
             summary = f"[DEGRADED] {summary}"
-        payload = format_pager_payload(state["token"], service, summary)
+        books = _runbooks(state)
+        payload = format_pager_payload(
+            state["token"],
+            service,
+            summary,
+            books[0].title if len(books) > 0 else None,
+            books[1].title if len(books) > 1 else None,
+        )
         audit = _Audit(state, ports)
         if payload.audit_event is not None:  # Req 3.3
             await audit.emit(
@@ -196,23 +210,50 @@ def build_graph(
             "status": "EXECUTING",
             "choice": choice,
             "action_id": selected.action_id if selected else UNKNOWN_ACTION,
-            "target_host": selected.target_host if selected else "",
+            "target_host": "",  # set by tripwire_guard from a fresh runbook lookup
             "audit_records": audit.dump(),
         }
 
     async def tripwire_guard(state: IncidentState) -> dict[str, Any]:
-        validator = TripwireValidator(r.action_id for r in _runbooks(state))
-        result = validator.validate(
-            target_host=state.get("target_host", ""),
-            service_name=state["service_name"],
-            action_id=state.get("action_id", UNKNOWN_ACTION),
-            token=state["token"],
-        )
+        # Authorization is re-queried now (no TOCTOU): state only maps the reply
+        # digit to an action id; approval and target host come from the fresh record.
+        service = state["service_name"]
+        action_id = state.get("action_id", UNKNOWN_ACTION)
         audit = _Audit(state, ports)
-        await audit.emit(result.audit_event(), result.audit_payload())
-        gates = ResolutionGates(tripwire_check_passed=result.passed)
-        update: dict[str, Any] = {"gates": gates.model_dump()}
-        if not result.passed:
+        update: dict[str, Any] = {}
+        try:
+            fresh = list(
+                await asyncio.wait_for(
+                    ports.runbooks.list_approved(service), RUNBOOK_LOOKUP_TIMEOUT_SECONDS
+                )
+            )
+        except Exception:  # includes TimeoutError: fail closed
+            logger.warning("runbook lookup failed for %s at execution time", service)
+            await audit.emit(
+                AuditEvent.TRIPWIRE_BLOCKED,
+                {"action_id": action_id, "token": state["token"], "reason": REASON_LOOKUP_FAILED},
+            )
+            passed = False
+        else:
+            matches = [r for r in fresh if r.action_id == action_id]
+            chosen = next((r for r in matches if r.target_host == service), None) or (
+                matches[0] if matches else None
+            )
+            result = TripwireValidator(r.action_id for r in fresh).validate(
+                # No fresh record => not approved; use the service so the reason is
+                # action_not_approved rather than a bogus host mismatch.
+                target_host=chosen.target_host if chosen is not None else service,
+                service_name=service,
+                action_id=action_id,
+                token=state["token"],
+            )
+            await audit.emit(result.audit_event(), result.audit_payload())
+            passed = result.passed
+            if passed and chosen is not None:
+                update["target_host"] = chosen.target_host
+        gates = ResolutionGates(tripwire_check_passed=passed)
+        update["gates"] = gates.model_dump()
+        if not passed:
             update["status"] = "BLOCKED_BY_TRIPWIRE"
             await _safe_send(  # alert operator; no execution follows
                 ports, sanitize_pager_text(f"INC-{state['token']} BLOCKED_BY_TRIPWIRE")

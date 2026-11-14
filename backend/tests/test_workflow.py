@@ -20,7 +20,7 @@ from backend.app.api.routes import AppServices
 from backend.app.main import Settings, build_in_memory_services, create_app
 from backend.app.services.guardrails import AuditRecord, verify_chain
 from backend.app.services.incident_store import InMemoryAuditStore
-from backend.app.services.twilio_client import TwilioSmsAdapter
+from backend.app.services.africastalking_client import AfricasTalkingSettings, AfricasTalkingSmsAdapter
 
 SERVICE = "auth-db"
 TOKEN = "7A"
@@ -63,12 +63,18 @@ class FakeAudit:
 
 
 class FakeRunbooks:
-    def __init__(self, succeed: bool = True) -> None:
+    def __init__(self, succeed: bool = True, approved: Sequence[Runbook] = RUNBOOKS) -> None:
         self.executed: list[tuple[str, str]] = []
         self._succeed = succeed
+        self.approved: tuple[Runbook, ...] = tuple(approved)  # mutable: revoke between calls
+        self.fail_lookup = False
+        self.lookups = 0
 
     async def list_approved(self, service_name: str) -> Sequence[Runbook]:
-        return RUNBOOKS
+        self.lookups += 1
+        if self.fail_lookup:
+            raise RuntimeError("runbook store unavailable")
+        return self.approved
 
     async def execute(self, *, target_host: str, action_id: str, token: str) -> bool:
         self.executed.append((target_host, action_id))
@@ -189,7 +195,7 @@ async def test_resume_survives_new_graph_instance_sharing_checkpointer() -> None
 
 async def test_tripwire_blocks_runbook_targeting_another_host() -> None:
     wrong_host = (Runbook(action_id="RB-AUTHDB-RESET-POOL", title="t", target_host="payment-gateway"),)
-    rig = Rig(telemetry=FakeTelemetry(wrong_host))
+    rig = Rig(telemetry=FakeTelemetry(wrong_host), runbooks=FakeRunbooks(approved=wrong_host))
     await rig.start()
     done = await rig.resume("1")
     assert done["status"] == "BLOCKED_BY_TRIPWIRE"
@@ -200,6 +206,72 @@ async def test_tripwire_blocks_runbook_targeting_another_host() -> None:
     events = [r.event_type for r in await rig.chain()]
     assert "TRIPWIRE_BLOCKED" in events and "REMEDIATION_EXECUTED" not in events
     assert verify_chain(await rig.chain()).valid
+
+
+async def _blocked_reasons(rig: Rig) -> list[str]:
+    return [
+        str(r.payload.get("reason"))
+        for r in await rig.chain()
+        if r.event_type == "TRIPWIRE_BLOCKED"
+    ]
+
+
+async def test_runbook_revoked_after_triage_is_blocked_without_execution() -> None:
+    rig = Rig()
+    await rig.start()  # triage cached both runbooks
+    rig.runbooks.approved = RUNBOOKS[1:]  # revoke option 1 before the reply
+    done = await rig.resume("1")
+    assert done["status"] == "BLOCKED_BY_TRIPWIRE"
+    assert rig.runbooks.executed == []
+    assert await _blocked_reasons(rig) == ["action_not_approved"]
+    assert verify_chain(await rig.chain()).valid
+
+
+async def test_target_host_comes_from_fresh_runbook_not_triage_state() -> None:
+    rig = Rig()
+    await rig.start()
+    rig.runbooks.approved = (
+        Runbook(action_id="RB-AUTHDB-RESET-POOL", title="Reset pool", target_host="payment-gateway"),
+    )
+    done = await rig.resume("1")
+    assert done["status"] == "BLOCKED_BY_TRIPWIRE"
+    assert rig.runbooks.executed == []
+    assert await _blocked_reasons(rig) == ["target_host_mismatch"]
+
+
+@pytest.mark.parametrize("mode", ["raises", "times_out"])
+async def test_runbook_lookup_failure_fails_closed(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = Rig()
+    await rig.start()
+    if mode == "raises":
+        rig.runbooks.fail_lookup = True
+    else:
+        import asyncio
+
+        import backend.app.agents.graph as graph_module
+
+        async def hang(service_name: str) -> Sequence[Runbook]:
+            await asyncio.sleep(10)
+            return RUNBOOKS
+
+        monkeypatch.setattr(graph_module, "RUNBOOK_LOOKUP_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(rig.runbooks, "list_approved", hang)
+    done = await rig.resume("1")
+    assert done["status"] == "BLOCKED_BY_TRIPWIRE"
+    assert rig.runbooks.executed == []
+    assert await _blocked_reasons(rig) == ["runbook_lookup_failed"]
+
+
+async def test_unchanged_runbook_requeried_at_execution_and_resolves() -> None:
+    rig = Rig()
+    await rig.start()
+    before = rig.runbooks.lookups
+    done = await rig.resume("1")
+    assert rig.runbooks.lookups == before + 1  # fresh lookup at execution time
+    assert done["status"] == "RESOLVED"
+    assert rig.runbooks.executed == [(SERVICE, "RB-AUTHDB-RESET-POOL")]
 
 
 @pytest.mark.parametrize("choice", ["3", "0", "", "x"])
@@ -261,7 +333,7 @@ async def test_resolved_withheld_unless_all_four_gates_true(
 
 
 async def test_api_never_persists_resolved_when_a_gate_fails() -> None:
-    sms = TwilioSmsAdapter()
+    sms = AfricasTalkingSmsAdapter(AfricasTalkingSettings(dry_run=True))
     base = build_in_memory_services(Settings(use_in_memory=True))
     ports = Ports(
         telemetry=FakeTelemetry(),
@@ -277,12 +349,15 @@ async def test_api_never_persists_resolved_when_a_gate_fails() -> None:
         audit=base.audit,
     )
     with TestClient(create_app(services, Settings(frontend_dir=None, dry_run=True))) as client:
-        token = client.post(
+        accepted = client.post(
             "/webhooks/alerts", json={"service_name": SERVICE, "error_code": "E1"}
-        ).json()["token"]
-        assert client.post("/api/demo/reply", json={"token": token, "choice": 1}).status_code == 202
-        states = {i["token"]: i["state"] for i in client.get("/api/incidents").json()}
-        assert states == {token: "FAILED"}  # Req 5.6: never RESOLVED, and the lock is freed
+        ).json()
+        incident_id = accepted["incident_id"]
+        assert (
+            client.post("/api/demo/reply", json={"incident_id": incident_id, "choice": 1}).status_code == 202
+        )
+        states = {i["incident_id"]: i["state"] for i in client.get("/api/incidents").json()}
+        assert states == {incident_id: "FAILED"}  # Req 5.6: never RESOLVED, and the lock is freed
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +367,7 @@ async def test_api_never_persists_resolved_when_a_gate_fails() -> None:
 
 @pytest.fixture()
 def api() -> Iterator[tuple[TestClient, AppServices]]:
-    services = build_in_memory_services(Settings(use_in_memory=True, twilio_auth_token="t"))
+    services = build_in_memory_services(Settings(use_in_memory=True))
     with TestClient(create_app(services, Settings(frontend_dir=None, dry_run=True))) as client:
         yield client, services
 
@@ -309,7 +384,7 @@ def test_duplicate_alerts_start_exactly_one_agent_run(api: tuple[TestClient, App
         assert dup.status_code == 200
         assert dup.json() == {"status": "DEDUPLICATED", "incident_id": incident_id}
 
-    outbox = cast(TwilioSmsAdapter, services.sms).outbox
+    outbox = cast(AfricasTalkingSmsAdapter, services.sms).outbox
     assert len(outbox) == 1  # one pager => one graph run
     assert len(client.get("/api/incidents").json()) == 1
     records = client.get(f"/api/incidents/{incident_id}/audit").json()["records"]
@@ -322,14 +397,14 @@ def test_different_fingerprints_each_start_a_run(api: tuple[TestClient, AppServi
     a = client.post("/webhooks/alerts", json={"service_name": SERVICE, "error_code": "E1"})
     b = client.post("/webhooks/alerts", json={"service_name": SERVICE, "error_code": "E2"})
     assert a.status_code == b.status_code == 202
-    assert len(cast(TwilioSmsAdapter, services.sms).outbox) == 2
+    assert len(cast(AfricasTalkingSmsAdapter, services.sms).outbox) == 2
 
 
 def test_fingerprint_is_released_after_resolution(api: tuple[TestClient, AppServices]) -> None:
     client, _ = api
     alert = {"service_name": SERVICE, "error_code": "E1"}
-    token = client.post("/webhooks/alerts", json=alert).json()["token"]
-    client.post("/api/demo/reply", json={"token": token, "choice": 1})
+    incident_id = client.post("/webhooks/alerts", json=alert).json()["incident_id"]
+    client.post("/api/demo/reply", json={"incident_id": incident_id, "choice": 1})
     again = client.post("/webhooks/alerts", json=alert)
     assert again.status_code == 202
     assert isinstance(UUID(again.json()["incident_id"]), UUID)

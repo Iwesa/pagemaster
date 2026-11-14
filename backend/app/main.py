@@ -12,11 +12,15 @@
   ``GEMINI_API_KEY`` /  optional LLM summarizer keys (Gemini preferred); absent = deterministic.
   ``OPENAI_API_KEY``
   ``REDIS_URL``         Redis for the dedup lock.
-  ``TWILIO_AUTH_TOKEN`` verifies ``X-Twilio-Signature`` (missing token rejects all).
-  ``PUBLIC_BASE_URL``   externally visible base URL Twilio signs (proxies/tunnels).
+  ``AFRICASTALKING_*``  username, API key, shortcode, webhook secret (``X-Webhook-Secret``
+                        header or ``?secret=``; unset rejects all inbound SMS), plus
+                        ``ONCALL_PHONE_NUMBER`` (the only accepted reply sender).
+  ``PUBLIC_BASE_URL``   no longer used for signatures; kept for compatibility.
   ``ALERT_WEBHOOK_SECRET`` optional; when set, ``POST /webhooks/alerts`` requires
                         ``Authorization: Bearer <secret>`` (401 otherwise).
   ``FRONTEND_DIR``      static UI directory (default ``<repo>/frontend``).
+  ``APPROVAL_TTL_SECONDS`` seconds an incident may await approval before it expires (900).
+  ``REAPER_INTERVAL_SECONDS`` how often the background reaper looks for expired approvals (30).
   ``DRY_RUN``           default true; registers ``/api/demo/*`` (simulated replies, outbox).
   ===================== ==========================================================
 
@@ -25,6 +29,8 @@ Requirements: 1.1, 4.1, 4.2.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import AsyncIterator, Mapping
@@ -34,12 +40,17 @@ from typing import Final
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.agents.graph import build_graph, compile_with_postgres
 from backend.app.agents.ports import Ports
 from backend.app.api.routes import AppServices, demo_router, router
+from backend.app.services.africastalking_client import (
+    AfricasTalkingSettings,
+    AfricasTalkingSmsAdapter,
+)
 from backend.app.services.dedup import InMemoryDedupStore
+from backend.app.services.seen_ids import InMemorySeenIdStore
 from backend.app.services.llm_summarizer import DisabledSummarizer, LlmSummarizer
 from backend.app.services.incident_store import InMemoryAuditStore, InMemoryIncidentRepository
 from backend.app.services.mcp_client import McpSubprocessTelemetry
@@ -48,7 +59,6 @@ from backend.app.services.telemetry_adapters import (
     SimulatedRunbooks,
     StaticTelemetry,
 )
-from backend.app.services.twilio_client import TwilioSmsAdapter
 
 logger = logging.getLogger("pagemaster.main")
 _TRUE_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
@@ -66,11 +76,13 @@ class Settings(BaseModel):
     gemini_api_key: str = ""
     openai_api_key: str = ""
     redis_url: str = "redis://localhost:6379/0"
-    twilio_auth_token: str = ""
-    public_base_url: str | None = None
+    africastalking: AfricasTalkingSettings = AfricasTalkingSettings()
+    public_base_url: str | None = None  # unused by SMS auth; kept for compatibility
     alert_webhook_secret: str = ""  # optional; when set, POST /webhooks/alerts needs a Bearer token
     frontend_dir: Path | None = None
-    dry_run: bool = False  # enables the demo routes; from_env defaults to True like TwilioSettings
+    approval_ttl_seconds: int = Field(default=900, gt=0)
+    reaper_interval_seconds: float = Field(default=30.0, gt=0)
+    dry_run: bool = False  # enables the demo routes; from_env defaults to True like AfricasTalkingSettings
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -84,10 +96,12 @@ class Settings(BaseModel):
             gemini_api_key=source.get("GEMINI_API_KEY", "").strip(),
             openai_api_key=source.get("OPENAI_API_KEY", "").strip(),
             redis_url=source.get("REDIS_URL", "redis://localhost:6379/0"),
-            twilio_auth_token=source.get("TWILIO_AUTH_TOKEN", ""),
+            africastalking=AfricasTalkingSettings.from_env(source),
             public_base_url=source.get("PUBLIC_BASE_URL") or None,
             alert_webhook_secret=source.get("ALERT_WEBHOOK_SECRET", "").strip(),
             frontend_dir=Path(frontend) if frontend else None,
+            approval_ttl_seconds=int(source.get("APPROVAL_TTL_SECONDS", "900") or "900"),
+            reaper_interval_seconds=float(source.get("REAPER_INTERVAL_SECONDS", "30") or "30"),
             dry_run=source.get("DRY_RUN", "true").strip().lower() in (_TRUE_VALUES | {""}),
         )
 
@@ -98,7 +112,7 @@ def build_in_memory_services(settings: Settings) -> AppServices:
 
     incidents = InMemoryIncidentRepository()
     audit = InMemoryAuditStore(incidents)
-    sms = TwilioSmsAdapter()
+    sms = AfricasTalkingSmsAdapter(settings.africastalking.model_copy(update={"dry_run": True}))
     ports = Ports(
         telemetry=StaticTelemetry(),
         sms=sms,
@@ -106,15 +120,22 @@ def build_in_memory_services(settings: Settings) -> AppServices:
         runbooks=SimulatedRunbooks(),
         summarizer=DisabledSummarizer(),
     )
+    async def reseed_noop() -> int:  # static telemetry has no logs to age out
+        return 0
+
     return AppServices(
         graph=build_graph(ports, MemorySaver()),
         dedup=InMemoryDedupStore(),
         sms=sms,
         incidents=incidents,
         audit=audit,
-        twilio_auth_token=settings.twilio_auth_token,
-        public_base_url=settings.public_base_url,
+        africastalking_webhook_secret=settings.africastalking.webhook_secret.get_secret_value(),
+        oncall_phone_number=settings.africastalking.to_number,
+        africastalking_shortcode=settings.africastalking.shortcode,
+        seen_ids=InMemorySeenIdStore(),
         alert_webhook_secret=settings.alert_webhook_secret,
+        reseed=reseed_noop,
+        approval_ttl_seconds=settings.approval_ttl_seconds,
     )
 
 
@@ -123,12 +144,14 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> AppS
     import asyncpg  # type: ignore[import-untyped]
     from redis.asyncio import Redis
 
-    from backend.app.mcp.server import TelemetryStore
+    from backend.app.mcp.server import TelemetryStore, reseed_recent_logs
     from backend.app.services.dedup import RedisDedupStore
+    from backend.app.services.seen_ids import RedisSeenIdStore
     from backend.app.services.postgres_store import (
         PostgresAuditStore,
         PostgresIncidentRepository,
         ensure_system_incident,
+        sync_mcp_reader_password,
     )
 
     if not settings.database_url:
@@ -139,11 +162,25 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> AppS
         raise RuntimeError("could not create database pool")
     stack.push_async_callback(pool.close)
     await ensure_system_incident(pool)
+    try:
+        await sync_mcp_reader_password(pool, os.environ.get("MCP_READER_PASSWORD"))
+    except asyncpg.PostgresError:
+        logger.warning("could not sync mcp_reader password (insufficient privilege?)")
+
+    # Admin/app pool (not mcp_reader) refreshes demo logs; never inside the MCP read-only txn.
+    async def reseed() -> int:
+        return await reseed_recent_logs(pool)
+
+    if settings.dry_run:
+        try:
+            logger.info("reseeded %d demo log rows", await reseed())
+        except (asyncpg.PostgresError, OSError, TimeoutError):
+            logger.warning("startup demo log reseed failed")
 
     redis = Redis.from_url(settings.redis_url)
     stack.push_async_callback(redis.aclose)
 
-    sms = TwilioSmsAdapter()
+    sms = AfricasTalkingSmsAdapter(settings.africastalking.model_copy(update={"dry_run": settings.dry_run}))
     stack.push_async_callback(sms.aclose)
 
     telemetry: DatabaseTelemetry | McpSubprocessTelemetry
@@ -161,6 +198,10 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> AppS
     )
     stack.push_async_callback(summarizer.aclose)
 
+    async def ping() -> None:
+        await pool.fetchval("SELECT 1")
+        await redis.ping()
+
     incidents = PostgresIncidentRepository(pool)
     audit = PostgresAuditStore(pool)
     ports = Ports(
@@ -177,9 +218,14 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> AppS
         sms=sms,
         incidents=incidents,
         audit=audit,
-        twilio_auth_token=settings.twilio_auth_token,
-        public_base_url=settings.public_base_url,
+        africastalking_webhook_secret=settings.africastalking.webhook_secret.get_secret_value(),
+        oncall_phone_number=settings.africastalking.to_number,
+        africastalking_shortcode=settings.africastalking.shortcode,
+        seen_ids=RedisSeenIdStore(redis),
         alert_webhook_secret=settings.alert_webhook_secret,
+        reseed=reseed,
+        ping=ping,
+        approval_ttl_seconds=settings.approval_ttl_seconds,
     )
 
 
@@ -198,16 +244,28 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        if services is not None:
-            app.state.services = services
-            yield
-            return
         async with AsyncExitStack() as stack:
-            if cfg.use_in_memory:
+            if services is not None:
+                app.state.services = services
+            elif cfg.use_in_memory:
                 app.state.services = build_in_memory_services(cfg)
             else:
                 app.state.services = await build_real_services(cfg, stack)
-            yield
+            lifecycle = app.state.services.lifecycle
+            # Req 6.4: orphaned TRIAGING/EXECUTING incidents fail before we serve traffic.
+            try:
+                count = await lifecycle.reconcile_orphans()
+                if count:
+                    logger.warning("reconciled %d orphaned incidents to FAILED", count)
+            except Exception:
+                logger.exception("startup reconciliation failed")
+            reaper = asyncio.create_task(lifecycle.run_reaper(cfg.reaper_interval_seconds), name="approval-reaper")
+            try:
+                yield
+            finally:
+                reaper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reaper
 
     app = FastAPI(title="Pagemaster", lifespan=lifespan)
     if services is not None:

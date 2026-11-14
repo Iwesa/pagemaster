@@ -15,7 +15,7 @@ CREATE TABLE incidents (
     error_code              TEXT NOT NULL,
     fingerprint             TEXT GENERATED ALWAYS AS (service_name || ':' || error_code) STORED,
     state                   TEXT NOT NULL DEFAULT 'TRIAGING'
-        CHECK (state IN ('TRIAGING', 'AWAITING_APPROVAL', 'EXECUTING', 'RESOLVED', 'BLOCKED_BY_TRIPWIRE', 'FAILED')),
+        CHECK (state IN ('TRIAGING', 'AWAITING_APPROVAL', 'EXECUTING', 'RESOLVED', 'BLOCKED_BY_TRIPWIRE', 'FAILED', 'EXPIRED')),
     raw_alert               JSONB NOT NULL DEFAULT '{}'::jsonb,
     tripwire_check_passed   BOOLEAN NOT NULL DEFAULT FALSE,
     simulated_step_executed BOOLEAN NOT NULL DEFAULT FALSE,
@@ -34,7 +34,7 @@ CREATE TABLE incidents (
 );
 
 -- Token must be unique among active incidents; fingerprint dedup (Req 1.2) is one active incident each.
--- Terminal states (RESOLVED, BLOCKED_BY_TRIPWIRE, FAILED) are excluded so they free the fingerprint (Req 5.6).
+-- Terminal states (RESOLVED, BLOCKED_BY_TRIPWIRE, FAILED, EXPIRED) are excluded so they free the fingerprint (Req 5.6).
 CREATE UNIQUE INDEX uq_incidents_active_token
     ON incidents (token) WHERE state IN ('TRIAGING', 'AWAITING_APPROVAL', 'EXECUTING');
 CREATE UNIQUE INDEX uq_incidents_active_fingerprint

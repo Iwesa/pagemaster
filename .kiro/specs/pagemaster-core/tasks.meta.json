@@ -263,6 +263,323 @@
         "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
         "timestamp": 1794647275462
       }
+    ],
+    "6.1 Update `_SQL_ENSURE_SYSTEM` in `backend/app/services/postgres_store.py` to insert `TRUE` for `tripwire_check_passed`, `simulated_step_executed`, `confirmation_sms_sent`, and `audit_record_committed`, and sync `mcp_reader` password from `MCP_READER_PASSWORD` during startup initialization.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667615363
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667662236
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667808650
+      }
+    ],
+    "6.2 Update `backend/tests/test_postgres_integration.py` to read `database/init_mock_logs.sql` using `encoding=\"utf-8-sig\"` and add `test_ensure_system_incident_satisfies_check_constraint`.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667618219
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667814357
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667876809
+      }
+    ],
+    "6.3 Update `TelemetryStore._fetch` in `backend/app/mcp/server.py` to return `Confidence.DEGRADED` (`degraded_reason=\"no recent logs in window\"`) when `recent_logs` is empty, and add `reseed_recent_logs()` invoked on startup in `DRY_RUN=true` mode (plus `POST /api/demo/reseed`) so demo logs never age out of the 15-minute `v_recent_logs` window.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667618566
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667882681
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668055311
+      }
+    ],
+    "7.1 Implement GSM 03.38 (GSM-7) septet counting (`gsm7_septets`) and UCS-2 prevention in `backend/app/services/guardrails.py` (transliterating backticks/smart quotes, accounting for 2-septet extension characters `^{}\\\\[~]|€`, and clamping `gsm7_septets(text) <= 160`).": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667618915
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668065141
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668276749
+      }
+    ],
+    "7.2 Update `format_pager_payload` and `supervisor_formatter` (`backend/app/agents/graph.py`) to include short titles for options `1` and `2` (`INC-<TOKEN> <service>: <summary>. <TOKEN>-1:<t1> <TOKEN>-2:<t2>`) within the 160-septet budget.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667619909
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668277801
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668473711
+      }
+    ],
+    "7.3 Escape XML delimiter tags (`</logs>`, `<logs>`) in `backend/app/services/llm_summarizer.py` before interpolating untrusted log text into LLM prompts.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667620535
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668285539
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668475688
+      }
+    ],
+    "7.4 Extend `backend/tests/test_properties.py` with Hypothesis properties verifying `gsm7_septets(payload.text) <= 160`, zero UCS-2 fallback characters, and presence of both action titles.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667620866
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668482453
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669090423
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669098081
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669530639
+      }
+    ],
+    "8.1 Implement `AfricasTalkingSmsAdapter` and `AfricasTalkingSettings` in `backend/app/services/africastalking_client.py` using `httpx.AsyncClient` (supporting sandbox vs. production endpoints, `AFRICASTALKING_USERNAME`, `AFRICASTALKING_API_KEY`, `AFRICASTALKING_SHORTCODE`, `ONCALL_PHONE_NUMBER`, and `DRY_RUN` outbox).": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667622311
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668484373
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669070780
+      }
+    ],
+    "8.2 Replace `/webhooks/twilio/sms` in `backend/app/api/routes.py` with `POST /webhooks/africastalking/sms` validating `AFRICASTALKING_WEBHOOK_SECRET`, canonical E.164 sender match (`from == ONCALL_PHONE_NUMBER`), optional shortcode `to` match, and AT message `id` idempotency; log `SECURITY_VIOLATION` and return `403` on unauthorized senders.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667622800
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669535687
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669864732
+      }
+    ],
+    "8.3 Remove `token` from `IncidentView` (`GET /api/incidents`) and strip `token` from audit record payloads returned by `GET /api/incidents/{incident_id}/audit`.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667624177
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669867032
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794670117787
+      }
+    ],
+    "8.4 Update `backend/tests/test_api.py` and `frontend/index.html` for Africa's Talking webhook payloads, unauthorized sender `403` rejection, and token redaction.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667626180
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794670119728
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794670799822
+      }
+    ],
+    "9.1 Update `tripwire_guard` in `backend/app/agents/graph.py` to query `ports.runbooks.list_approved(state[\"service_name\"])` dynamically at execution time rather than trusting cached triage state, verifying `action_id` is currently approved for `service_name`.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667626686
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794670806690
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794671103518
+      }
+    ],
+    "9.2 Add `EXPIRED` to `IncidentStatus` and `TERMINAL_STATUSES` (and the `incidents` SQL `CHECK` constraint in `database/init_mock_logs.sql`), add `APPROVAL_TTL_SECONDS` expiration checks on reply and via a lifespan background reaper, and reconcile orphaned `TRIAGING`/`EXECUTING` incidents to `FAILED` on startup.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667628187
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794671108487
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794672382284
+      }
+    ],
+    "9.3 Add unit, workflow, and Hypothesis property tests in `backend/tests/test_workflow.py` and `backend/tests/test_properties.py` covering TOCTOU runbook revocation, approval expiration, and startup crash recovery.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667628576
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794672391342
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794673093796
+      }
+    ],
+    "10.1 Add `GET /healthz` to `backend/app/api/routes.py` and a `healthcheck` block to `backend` in `docker-compose.yml`.": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667631087
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794670818435
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794671105618
+      }
+    ],
+    "10.2 Bind Postgres and Redis ports in `docker-compose.yml` to `127.0.0.1`, configure Redis password authentication, replace `TWILIO_*` env vars with `AFRICASTALKING_*` and `APPROVAL_TTL_SECONDS`, and pin dependency versions in `backend/requirements.txt` (including `mcp>=1.2,<2`).": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794667633351
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794671109834
+      },
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794672384889
+      }
+    ],
+    "6. Fix PostgreSQL startup gate crash, BOM encoding, and fresh telemetry confidence": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794668055744
+      }
+    ],
+    "7. Enforce GSM-7 single-SMS septet budget, runbook action titles, and prompt escaping": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794669533092
+      }
+    ],
+    "8. Migrate SMS transport to Africa's Talking and lock down reply authorization": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794670802864
+      }
+    ],
+    "10. Harden Docker Compose, healthchecks, and dependency pinning": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794672385680
+      }
+    ],
+    "9. Implement non-circular TOCTOU Tripwire, incident approval expiry, and crash reconciliation": [
+      {
+        "executionId": "3e5af4c2-7a3c-4df8-b432-38028ae730e1",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1794673095792
+      }
     ]
   }
 }

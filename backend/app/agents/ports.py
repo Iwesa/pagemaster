@@ -1,6 +1,6 @@
 """Typed port interfaces for the incident graph (hexagonal boundary).
 
-Adapters (MCP client, Twilio/mock SMS, Postgres audit store, runbook store)
+Adapters (MCP client, Africa's Talking/mock SMS, Postgres audit store, runbook store)
 live outside ``backend/app/agents/`` and are injected via ``build_graph``.
 """
 

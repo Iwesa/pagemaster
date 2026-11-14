@@ -478,3 +478,330 @@ def test_property_6_failed_runs_end_failed_and_release_lock(
     else:
         assert state == "FAILED"  # RESOLVED is never written without all four gates
     assert freed  # every terminal state frees the fingerprint
+
+
+# ---------------------------------------------------------------------------
+# Property 7: single-SMS septet budget (Req 3.1, 3.2, 3.3)
+# ---------------------------------------------------------------------------
+
+from backend.app.services.guardrails import (  # noqa: E402
+    _GSM7_BASIC,
+    _GSM7_EXTENSION,
+    gsm7_septets,
+)
+
+_P7_SPECIAL = "`\u2018\u2019\u201c\u201d{}[]|^~\\\u20ac\U0001f600\u00e9\u00fc\u4e2d\n\t\x00 @$_%"
+_p7_text = st.one_of(
+    st.text(max_size=400),
+    st.text(alphabet=_P7_SPECIAL, max_size=300),
+    st.lists(
+        st.one_of(st.sampled_from(_SENSITIVE_FRAGMENTS), st.text(alphabet=_P7_SPECIAL, max_size=12), st.text(max_size=12)),
+        max_size=30,
+    ).map(" ".join),
+)
+_p7_title = st.one_of(st.none(), _p7_text)
+_GSM_ALL = sorted(_GSM7_BASIC | _GSM7_EXTENSION)
+_ASCII_EXT = set("^{}\\[~]|")
+
+
+@settings(max_examples=200, deadline=None)
+@given(token=tokens, service=_p7_text, summary=_p7_text, t1=_p7_title, t2=_p7_title)
+def test_property_7_single_sms_septet_budget(
+    token: str, service: str, summary: str, t1: str | None, t2: str | None
+) -> None:
+    """**Validates: Requirements 3.1, 3.2, 3.3**"""
+    text = format_pager_payload(token, service, summary, t1, t2).text
+    assert text.isascii()
+    assert all(c in _GSM7_BASIC or c in _GSM7_EXTENSION for c in text)  # no UCS-2 trigger
+    assert gsm7_septets(text) <= 160  # raises if not GSM-7 encodable
+    assert text.startswith(f"INC-{token} ")
+    if f"{token}-1:" in text:
+        # Main path: both action markers, each followed by a non-empty title.
+        assert f"{token}-2:" in text
+        for n in (1, 2):
+            tail = text.split(f"{token}-{n}:", 1)[1]
+            assert tail[:1] not in ("", " ")
+    else:
+        # Documented last-resort fallback: both reply codes survive.
+        assert text == f"INC-{token} Reply {token}-1 or {token}-2"
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    token=tokens,
+    service=_p7_text,
+    summary=_p7_text,
+    t1=st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=1, max_size=4),
+    t2=st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=1, max_size=4),
+)
+def test_property_7_short_titles_appear_verbatim(token: str, service: str, summary: str, t1: str, t2: str) -> None:
+    """**Validates: Requirements 3.1, 3.2**"""
+    text = format_pager_payload(token, service, summary, t1, t2).text
+    assert text.endswith(f". {token}-1:{t1} {token}-2:{t2}")
+
+
+@settings(max_examples=200, deadline=None)
+@given(s=st.text(alphabet=st.sampled_from(_GSM_ALL), max_size=300))
+def test_property_7_septets_equal_len_plus_extension_chars(s: str) -> None:
+    """**Validates: Requirements 3.1**"""
+    assert gsm7_septets(s) == len(s) + sum(1 for c in s if c in _GSM7_EXTENSION)
+
+
+@settings(max_examples=200, deadline=None)
+@given(token=tokens, service=_p7_text, summary=_p7_text, t1=_p7_title, t2=_p7_title)
+def test_property_7_extension_chars_in_pages_count_double(
+    token: str, service: str, summary: str, t1: str | None, t2: str | None
+) -> None:
+    """**Validates: Requirements 3.1**"""
+    text = format_pager_payload(token, service, summary, t1, t2).text
+    ext = sum(1 for c in text if c in _GSM7_EXTENSION)
+    assert ext == sum(1 for c in text if c in _ASCII_EXT)  # euro/form feed never survive
+    assert gsm7_septets(text) == len(text) + ext
+    assert len(text) + ext <= 160
+
+
+# ---------------------------------------------------------------------------
+# Property 8: inbound reply authorization (Req 4.2, 4.3)
+# A reply changes incident state only when the secret matches AND the canonical E.164
+# sender equals ONCALL_PHONE_NUMBER AND the shortcode matches (when configured) AND the
+# message id has not been seen.
+# ---------------------------------------------------------------------------
+
+from fastapi.testclient import TestClient  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
+
+from backend.app.api.routes import authorize_inbound_sms  # noqa: E402
+from backend.app.main import Settings, build_in_memory_services, create_app  # noqa: E402
+from backend.app.services.africastalking_client import (  # noqa: E402
+    AfricasTalkingSettings,
+    canonicalize_e164,
+)
+
+_P8_ONCALL = "+254711000111"
+_P8_SHORTCODE = "20880"
+_P8_SECRET = "p8-secret"
+
+_p8_senders = st.sampled_from(
+    [_P8_ONCALL, "254711000111", " +254711000111 ", "+254 711 000 111", "+254711000112", "+14155550123", "", "abc", "+0"]
+)
+_p8_to = st.sampled_from([_P8_SHORTCODE, " 20880 ", "99999", "", "abc"])
+_p8_secrets = st.sampled_from([_P8_SECRET, "wrong", "", _P8_SECRET + "x"])
+_p8_shortcodes = st.sampled_from([_P8_SHORTCODE, ""])  # configured / not configured
+
+
+def _p8_expected(secret: str, sender: str, to: str, shortcode: str, seen: bool) -> bool:
+    sender_ok = canonicalize_e164(sender) == canonicalize_e164(_P8_ONCALL)
+    code = "".join(ch for ch in shortcode if ch.isdigit())
+    shortcode_ok = not shortcode.strip() or "".join(ch for ch in to if ch.isdigit()) == code
+    return secret == _P8_SECRET and sender_ok and shortcode_ok and not seen
+
+
+@settings(max_examples=200, deadline=None)
+@given(secret=_p8_secrets, sender=_p8_senders, to=_p8_to, shortcode=_p8_shortcodes)
+def test_property_8_pure_authorization_matches_model(secret: str, sender: str, to: str, shortcode: str) -> None:
+    """**Validates: Requirements 4.2, 4.3**"""
+    reason = authorize_inbound_sms(
+        expected_secret=_P8_SECRET,
+        supplied_secrets=(secret, ""),
+        sender=sender,
+        to=to,
+        oncall_phone_number=_P8_ONCALL,
+        shortcode=shortcode,
+    )
+    assert (reason is None) == _p8_expected(secret, sender, to, shortcode, seen=False)
+
+
+@settings(max_examples=200, deadline=None)
+@given(secret=st.text(max_size=20), sender=st.text(max_size=20), to=st.text(max_size=10))
+def test_property_8_unconfigured_secret_always_rejects(secret: str, sender: str, to: str) -> None:
+    """**Validates: Requirements 4.2**"""
+    assert (
+        authorize_inbound_sms(
+            expected_secret="",
+            supplied_secrets=(secret,),
+            sender=sender,
+            to=to,
+            oncall_phone_number=_P8_ONCALL,
+            shortcode="",
+        )
+        is not None
+    )
+
+
+@settings(max_examples=200, deadline=None)
+@given(secret=_p8_secrets, sender=_p8_senders, to=_p8_to, shortcode=_p8_shortcodes, seen=st.booleans())
+def test_property_8_route_changes_state_only_when_authorized(
+    secret: str, sender: str, to: str, shortcode: str, seen: bool
+) -> None:
+    """**Validates: Requirements 4.2, 4.3**"""
+    at = AfricasTalkingSettings(
+        webhook_secret=SecretStr(_P8_SECRET), to_number=_P8_ONCALL, shortcode=shortcode
+    )
+    svc = build_in_memory_services(Settings(use_in_memory=True, africastalking=at))
+    with TestClient(create_app(svc, Settings(frontend_dir=None))) as client:
+        alert = {"service_name": "auth-db", "error_code": "DB_POOL_EXHAUSTED", "summary": "x"}
+        incident_id = UUID(client.post("/webhooks/alerts", json=alert).json()["incident_id"])
+        record = asyncio.run(svc.incidents.get(incident_id))
+        assert record is not None and record.state == "AWAITING_APPROVAL"
+        if seen:
+            assert asyncio.run(svc.seen_ids.claim("ATXid_p8"))
+        form = {"from": sender, "to": to, "text": f"{record.token}-1", "date": "d", "id": "ATXid_p8", "linkId": "l"}
+        headers = {"X-Webhook-Secret": secret} if secret else {}
+        resp = client.post("/webhooks/africastalking/sms", data=form, headers=headers)
+        after = asyncio.run(svc.incidents.get(incident_id))
+        assert after is not None
+        if _p8_expected(secret, sender, to, shortcode, seen):
+            assert resp.status_code == 200 and after.state == "RESOLVED"
+        else:
+            assert after.state == "AWAITING_APPROVAL"
+            assert resp.status_code in (200, 403) and (resp.status_code == 403 or seen)
+
+
+# ---------------------------------------------------------------------------
+# Property 9: TOCTOU Tripwire (Req 5.2)
+# Approved-set mutations between triage and execution: the graph resolves iff the chosen
+# action is currently approved for the service with a matching host.
+# ---------------------------------------------------------------------------
+
+_P9_MUTATIONS = st.sampled_from(["keep", "remove", "wrong_host", "wrong_host_then_right"])
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    choice=st.sampled_from(["1", "2"]),
+    mutations=st.tuples(_P9_MUTATIONS, _P9_MUTATIONS),
+    lookup_fails=st.booleans(),
+)
+def test_property_9_toctou_tripwire(
+    choice: str, mutations: tuple[str, str], lookup_fails: bool
+) -> None:
+    """**Validates: Requirements 5.2**"""
+    from backend.app.agents.ports import Runbook
+    from backend.app.services.guardrails import verify_chain
+    from backend.tests.test_workflow import RUNBOOKS, SERVICE, Rig
+
+    async def scenario() -> None:
+        rig = Rig()
+        await rig.start()  # triage caches both runbooks as approved
+        assert rig.runbooks.executed == []
+        mutated: list[Runbook] = []
+        for book, mutation in zip(RUNBOOKS, mutations, strict=True):
+            wrong = book.model_copy(update={"target_host": "payment-gateway"})
+            if mutation == "keep":
+                mutated.append(book)
+            elif mutation == "wrong_host":
+                mutated.append(wrong)
+            elif mutation == "wrong_host_then_right":
+                mutated.extend([wrong, book])
+        rig.runbooks.approved = tuple(mutated)
+        rig.runbooks.fail_lookup = lookup_fails
+        chosen = RUNBOOKS[int(choice) - 1]
+        still_approved = any(
+            r.action_id == chosen.action_id and r.target_host == SERVICE for r in mutated
+        )
+        done = await rig.resume(choice)
+        events = [r.event_type for r in await rig.chain()]
+        assert verify_chain(await rig.chain()).valid
+        if still_approved and not lookup_fails:
+            assert done["status"] == "RESOLVED"
+            assert done["gates"] == {
+                "tripwire_check_passed": True,
+                "simulated_step_executed": True,
+                "confirmation_sms_sent": True,
+                "audit_record_committed": True,
+            }
+            assert rig.runbooks.executed == [(SERVICE, chosen.action_id)]
+        else:
+            assert done["status"] == "BLOCKED_BY_TRIPWIRE"
+            assert rig.runbooks.executed == []
+            assert done["gates"]["tripwire_check_passed"] is False
+            assert "TRIPWIRE_BLOCKED" in events and "REMEDIATION_EXECUTED" not in events
+            assert not any(m.endswith("RESOLVED") for m in rig.sms.sent)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 10: expiry and reconciliation (Req 6.1 to 6.5)
+# ---------------------------------------------------------------------------
+
+_P10_TTL = 900
+
+
+@settings(max_examples=200, deadline=None)
+@given(age=st.integers(min_value=0, max_value=3 * _P10_TTL), choice=st.sampled_from(["1", "2"]))
+def test_property_10_reply_expiry_vs_ttl(age: int, choice: str) -> None:
+    """**Validates: Requirements 6.1, 6.2, 6.3, 6.5**"""
+    from backend.tests.test_expiry import (
+        TTL,
+        add_incident,
+        events_of,
+        fingerprint_free,
+        make_services,
+        reply,
+        state_of,
+    )
+
+    assert TTL == _P10_TTL
+
+    async def scenario() -> None:
+        services, clock, graph = make_services()
+        incident = await add_incident(services, "AWAITING_APPROVAL")
+        clock.advance(age)
+        await reply(services, f"{incident.token}-{choice}")
+        state = await state_of(services, incident.incident_id)
+        if age > TTL:
+            assert state == "EXPIRED"
+            assert graph.calls == []  # no infrastructure mutation
+            assert (await events_of(services, incident.incident_id))[-1] == "INCIDENT_EXPIRED"
+        else:
+            assert state == "RESOLVED"
+            assert len(graph.calls) == 1
+        assert await fingerprint_free(services)  # both terminal states release the lock
+
+    asyncio.run(scenario())
+
+
+_P10_STATES = st.sampled_from(
+    ["TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED"]
+)
+
+
+@settings(max_examples=200, deadline=None)
+@given(states=st.lists(_P10_STATES, min_size=0, max_size=10))
+def test_property_10_reconcile_orphans_moves_exactly_active_orphans(states: list[str]) -> None:
+    """**Validates: Requirements 6.4, 6.5**"""
+    from typing import cast
+    from uuid import uuid4
+
+    from backend.app.services.dedup import Acquired, Duplicate
+    from backend.app.services.incident_store import IncidentStatus
+    from backend.tests.test_expiry import add_incident, events_of, make_services, state_of
+
+    async def scenario() -> None:
+        services, _, graph = make_services()
+        seeded = [
+            (
+                await add_incident(
+                    services, cast(IncidentStatus, state), token=f"T{i}", service=f"svc-{i}"
+                ),
+                state,
+                f"svc-{i}",
+            )
+            for i, state in enumerate(states)
+        ]
+        orphans = sum(1 for s in states if s in ("TRIAGING", "EXECUTING"))
+        assert await services.lifecycle.reconcile_orphans() == orphans
+        for incident, before, svc in seeded:
+            after = await state_of(services, incident.incident_id)
+            reconciled = "INCIDENT_RECONCILED" in await events_of(services, incident.incident_id)
+            probe = await services.dedup.acquire(svc, "E1", uuid4())
+            if before in ("TRIAGING", "EXECUTING"):
+                assert after == "FAILED" and reconciled
+                assert isinstance(probe, Acquired)  # lock released
+            else:
+                assert after == before and not reconciled
+                assert isinstance(probe, Duplicate)  # untouched, lock still held
+        assert graph.calls == []
+
+    asyncio.run(scenario())

@@ -57,6 +57,22 @@ _SQL_RUNBOOKS: Final[str] = (
 )
 
 
+NO_RECENT_LOGS_REASON: Final[str] = "no recent logs in window"
+
+#: Demo services whose seeded logs are kept inside the ``v_recent_logs`` window.
+DEMO_SERVICES: Final[tuple[str, ...]] = ("auth-db", "payment-gateway", "ledger-worker")
+
+# Fixed SQL for the admin-side reseed (never run by the MCP server). One global
+# shift preserves the seed's relative offsets (including its deliberately
+# out-of-window rows) and puts the newest demo row 30 seconds in the past.
+_SQL_RESEED: Final[str] = (
+    "UPDATE service_logs AS s SET logged_at = s.logged_at + d.shift "
+    "FROM (SELECT now() - INTERVAL '30 seconds' - max(logged_at) AS shift "
+    "FROM service_logs WHERE service_name = ANY($1::text[])) AS d "
+    "WHERE s.service_name = ANY($1::text[]) AND d.shift IS NOT NULL"
+)
+
+
 class Confidence(StrEnum):
     """Confidence of the returned context."""
 
@@ -155,12 +171,16 @@ class TelemetryStore:
                 logs = await conn.fetch(_SQL_RECENT_LOGS, service_name)
                 edges = await conn.fetch(_SQL_TOPOLOGY, service_name)
                 books = await conn.fetch(_SQL_RUNBOOKS, service_name)
+        recent = [LogEntry(**dict(r)) for r in logs]
+        # Req 2.4: an empty window is not "healthy"; flag it so the pager says so.
+        empty = not recent
         return IncidentContext(
             service_name=service_name,
-            confidence=Confidence.HIGH,
-            recent_logs=[LogEntry(**dict(r)) for r in logs],
+            confidence=Confidence.DEGRADED if empty else Confidence.HIGH,
+            recent_logs=recent,
             topology=[TopologyEdge(**dict(r)) for r in edges],
             runbooks=[RunbookOption(**dict(r)) for r in books],
+            degraded_reason=NO_RECENT_LOGS_REASON if empty else None,
         )
 
     async def get_incident_context(self, service_name: str) -> IncidentContext:
@@ -177,6 +197,20 @@ class TelemetryStore:
         except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, ValueError) as exc:
             logger.warning("telemetry query failed for %s: %s", service_name, type(exc).__name__)
             return _degraded(service_name, "database unavailable")
+
+
+async def reseed_recent_logs(pool: asyncpg.Pool) -> int:
+    """Shift the demo ``service_logs`` rows so they fall inside the 15-minute window.
+
+    Must be given an admin/app pool (table owner), NOT the ``mcp_reader`` pool, and it
+    runs outside the MCP server's read-only transaction. Returns the rows updated.
+    Requirement 2.5.
+    """
+    status: str = await pool.execute(_SQL_RESEED, list(DEMO_SERVICES), timeout=QUERY_TIMEOUT_SECONDS)
+    try:
+        return int(status.rsplit(" ", 1)[-1])
+    except ValueError:
+        return 0
 
 
 def resolve_dsn(env: Mapping[str, str] | None = None) -> str | None:

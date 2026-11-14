@@ -63,7 +63,9 @@ class _ContextSource(Protocol):
 def to_telemetry_context(ctx: IncidentContext) -> TelemetryContext:
     """Map an MCP ``IncidentContext`` onto the domain ``TelemetryContext``."""
     top = ctx.recent_logs[0] if ctx.recent_logs else None
-    cause = ctx.degraded_reason or ""
+    # The degraded reason is diagnostic, not a cause: an empty root_cause lets
+    # triage keep the alert's own summary (the page just carries [DEGRADED]).
+    cause = ""
     if top is not None:
         cause = f"{top.error_code or top.level}: {top.message}"
     return TelemetryContext(

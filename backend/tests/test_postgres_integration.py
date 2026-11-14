@@ -20,7 +20,12 @@ import pytest_asyncio
 
 from backend.app.services.guardrails import ResolutionGates
 from backend.app.services.incident_store import ActiveFingerprintError
-from backend.app.services.postgres_store import PostgresAuditStore, PostgresIncidentRepository
+from backend.app.services.incident_store import SYSTEM_INCIDENT_ID
+from backend.app.services.postgres_store import (
+    PostgresAuditStore,
+    PostgresIncidentRepository,
+    ensure_system_incident,
+)
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
@@ -38,7 +43,7 @@ ALL_TRUE = ResolutionGates(
 
 
 def _schema_sql() -> str:
-    text = SQL_PATH.read_text(encoding="utf-8")
+    text = SQL_PATH.read_text(encoding="utf-8-sig")  # file starts with a UTF-8 BOM
     start = text.index(_ROLE_START)
     # Cut back to the start of the comment banner line above the marker.
     start = text.rindex("-- ----", 0, start)
@@ -136,3 +141,21 @@ async def test_failed_frees_the_fingerprint_and_token(pool: asyncpg.Pool) -> Non
     assert second != first
     audit = PostgresAuditStore(pool)
     assert await audit.append_event(first, "INCIDENT_FAILED", {"reason": "test"}) is not None
+
+
+async def test_ensure_system_incident_satisfies_check_constraint(pool: asyncpg.Pool) -> None:
+    select = (
+        "SELECT state, tripwire_check_passed, simulated_step_executed, confirmation_sms_sent, "
+        "audit_record_committed FROM incidents WHERE incident_id = $1"
+    )
+    try:
+        await ensure_system_incident(pool)
+    except asyncpg.CheckViolationError as exc:  # pragma: no cover - regression guard
+        pytest.fail(f"system incident violated the RESOLVED gate CHECK: {exc}")
+    row = await pool.fetchrow(select, SYSTEM_INCIDENT_ID)
+    assert row is not None and tuple(row.values()) == ("RESOLVED", True, True, True, True)
+
+    await ensure_system_incident(pool)  # idempotent
+    assert await pool.fetchval("SELECT count(*) FROM incidents WHERE incident_id = $1", SYSTEM_INCIDENT_ID) == 1
+    row = await pool.fetchrow(select, SYSTEM_INCIDENT_ID)
+    assert row is not None and tuple(row.values()) == ("RESOLVED", True, True, True, True)
