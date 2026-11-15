@@ -40,6 +40,7 @@ __all__ = [
     "PagerInvariantError",
     "SmsSendError",
     "canonicalize_e164",
+    "extract_webhook_secret",
 ]
 
 PRODUCTION_URL: Final[str] = "https://api.africastalking.com/version1/messaging"
@@ -58,6 +59,34 @@ class AfricasTalkingConfigError(RuntimeError):
 
 class SmsSendError(RuntimeError):
     """Africa's Talking rejected the message or the request failed."""
+
+
+_BEARER_PREFIX: Final[str] = "bearer "
+
+
+def extract_webhook_secret(
+    x_webhook_secret: str | None,
+    authorization: str | None,
+    query_secret: str | None,
+    *,
+    allow_query: bool,
+) -> str | None:
+    """Pick the callback secret from the first available source, never falling through.
+
+    Order: ``X-Webhook-Secret`` header, ``Authorization: Bearer <secret>`` (scheme
+    case-insensitive, exactly one space, non-empty token), then ``?secret=`` only when
+    ``allow_query`` is true. An empty value counts as absent. The first available source
+    wins even if it is wrong, so a bad header is never rescued by a lower-priority source.
+    """
+    if x_webhook_secret:
+        return x_webhook_secret
+    if authorization and authorization[: len(_BEARER_PREFIX)].lower() == _BEARER_PREFIX:
+        token = authorization[len(_BEARER_PREFIX) :]
+        if token and not token[0].isspace():
+            return token
+    if allow_query and query_secret:
+        return query_secret
+    return None
 
 
 def canonicalize_e164(raw: str) -> str | None:

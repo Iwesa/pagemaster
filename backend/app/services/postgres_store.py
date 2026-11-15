@@ -23,8 +23,10 @@ from backend.app.services.guardrails import AuditRecord, ResolutionGates
 from backend.app.services.incident_store import (
     SYSTEM_INCIDENT_ID,
     ActiveFingerprintError,
+    ExpiryOutcome,
     IncidentRecord,
     IncidentStatus,
+    ReclaimedIncident,
     TokenCollisionError,
     rechain,
 )
@@ -64,6 +66,32 @@ _SQL_RECORD_RESOLUTION: Final[str] = (
 )
 _SQL_CAS_STATE: Final[str] = (
     "UPDATE incidents SET state = $3, updated_at = now() WHERE incident_id = $1 AND state = $2"
+)
+_SQL_RECONCILE_STALE: Final[str] = (
+    "UPDATE incidents SET state = 'FAILED', updated_at = now() "
+    "WHERE state IN ('TRIAGING', 'EXECUTING') "
+    "AND updated_at <= now() - make_interval(secs => $1::double precision) "
+    "RETURNING incident_id, token, service_name, error_code"
+)
+_SQL_EXPIRE_STALE_AWAITING: Final[str] = (
+    "UPDATE incidents SET state = 'EXPIRED', updated_at = now() "
+    "WHERE state = 'AWAITING_APPROVAL' "
+    "AND updated_at <= now() - make_interval(secs => $1::double precision) "
+    "RETURNING incident_id, token, service_name, error_code"
+)
+_SQL_EXPIRE_IF_STALE: Final[str] = (
+    "WITH cur AS ("
+    "SELECT incident_id, state, service_name, error_code, "
+    "(updated_at <= now() - make_interval(secs => $2::double precision)) AS is_expired "
+    "FROM incidents WHERE token = $1 "
+    "AND state IN ('TRIAGING', 'AWAITING_APPROVAL', 'EXECUTING') FOR UPDATE), "
+    "upd AS ("
+    "UPDATE incidents i SET state = 'EXPIRED', updated_at = now() FROM cur "
+    "WHERE i.incident_id = cur.incident_id AND cur.state = 'AWAITING_APPROVAL' AND cur.is_expired "
+    "RETURNING i.incident_id) "
+    "SELECT cur.incident_id, cur.state, cur.service_name, cur.error_code, cur.is_expired, "
+    "(upd.incident_id IS NOT NULL) AS expired_now "
+    "FROM cur LEFT JOIN upd ON upd.incident_id = cur.incident_id"
 )
 _SQL_LOCK: Final[str] = "SELECT 1 FROM incidents WHERE incident_id = $1 FOR UPDATE"
 _SQL_CHAIN: Final[str] = (
@@ -202,6 +230,47 @@ class PostgresIncidentRepository:
         async with self._pool.acquire() as conn:
             status = await conn.execute(_SQL_SET_STATE, incident_id, new)
         return bool(status.endswith(" 1"))
+
+    async def reconcile_stale_inflight(self, stale_seconds: int) -> list[ReclaimedIncident]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_RECONCILE_STALE, float(stale_seconds))
+        return [
+            ReclaimedIncident(
+                incident_id=r["incident_id"],
+                token=str(r["token"]).strip(),
+                service_name=r["service_name"],
+                error_code=r["error_code"],
+            )
+            for r in rows
+        ]
+
+    async def expire_stale_awaiting(self, ttl_seconds: float) -> list[ReclaimedIncident]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_EXPIRE_STALE_AWAITING, float(ttl_seconds))
+        return [
+            ReclaimedIncident(
+                incident_id=r["incident_id"],
+                token=str(r["token"]).strip(),
+                service_name=r["service_name"],
+                error_code=r["error_code"],
+            )
+            for r in rows
+        ]
+
+    async def expire_if_stale(self, token: str, ttl_seconds: float) -> ExpiryOutcome:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_EXPIRE_IF_STALE, token, float(ttl_seconds))
+        if row is None:
+            return ExpiryOutcome(found=False)
+        return ExpiryOutcome(
+            found=True,
+            incident_id=row["incident_id"],
+            state_before=row["state"],
+            expired_now=bool(row["expired_now"]),
+            is_expired=bool(row["is_expired"]),
+            service_name=row["service_name"],
+            error_code=row["error_code"],
+        )
 
     async def record_resolution(
         self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None

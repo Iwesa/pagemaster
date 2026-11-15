@@ -79,3 +79,11 @@ sequenceDiagram
 
 - `GET /healthz` returns 200 and backs a Docker `healthcheck` on the `backend` service.
 - Postgres and Redis are published on `127.0.0.1` only, Redis requires a password, and `backend/requirements.txt` pins versions.
+
+## Multi-Worker Safety, DB Clock and Header Auth
+
+- **Stale-lease reconciliation:** startup reconciliation fails only `TRIAGING`/`EXECUTING` rows with `updated_at <= now() - make_interval(secs => $1)` (`INFLIGHT_STALE_SECONDS`, default 60, minimum 10), in one `UPDATE ... RETURNING`. A worker that boots while another worker is mid-triage therefore leaves fresh incidents alone. An optional Redis leader lock (`pagemaster:reconcile_lock`, NX, 30 s) serializes concurrent boots. Each reclaimed incident gets an `INCIDENT_FAILED` audit record (`stale_inflight_reconciled`) and its dedup lock released. The in-memory repository mirrors the cutoff.
+- **DB-clock expiry:** with PostgreSQL, `expire_stale_awaiting(ttl)` and `expire_if_stale(token, ttl)` compare `updated_at` with `now()` inside SQL and return `is_expired` from the query, so application clock skew cannot extend or shorten the approval window. The reply paths (`/webhooks/africastalking/sms`, `/api/demo/reply`) call `expire_if_stale` before resuming the graph.
+- **Header-only callback secret:** the Africa's Talking secret is read from `X-Webhook-Secret`, then `Authorization: Bearer`. `?secret=` is ignored unless `ALLOW_QUERY_SECRET=true`, because URLs end up in proxy and access logs.
+- **Property 11:** For any set of `TRIAGING`/`EXECUTING` incidents with arbitrary ages and any cutoff, reconciliation fails exactly those older than the cutoff and leaves younger ones and all other states untouched. (Req 6.4)
+- **Property 12:** For any combination of header, bearer and query secrets and `ALLOW_QUERY_SECRET`, a reply is accepted only when a permitted source carries the configured secret. (Req 4.2, 4.3)

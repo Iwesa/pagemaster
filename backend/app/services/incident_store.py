@@ -21,7 +21,7 @@ from __future__ import annotations
 import secrets
 import string
 from collections.abc import Callable, Collection, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -83,6 +83,38 @@ class IncidentRecord(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ReclaimedIncident(BaseModel):
+    """An in-flight incident failed by stale-lease reconciliation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    incident_id: UUID
+    token: str
+    service_name: str
+    error_code: str
+
+
+class ExpiryOutcome(BaseModel):
+    """Result of the point-of-use expiry check (:meth:`IncidentRepository.expire_if_stale`).
+
+    ``found`` is False when no *active* incident holds the token (unknown, already
+    terminal, or just expired by a concurrent caller). ``is_expired`` is the store
+    clock's verdict (``updated_at <= now - ttl``) for any active state; only an
+    ``AWAITING_APPROVAL`` row that is expired is transitioned, with ``expired_now``
+    True for exactly one caller.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    found: bool
+    incident_id: UUID | None = None
+    state_before: IncidentStatus | None = None
+    expired_now: bool = False
+    is_expired: bool = False
+    service_name: str | None = None
+    error_code: str | None = None
+
+
 @runtime_checkable
 class IncidentRepository(Protocol):
     """Port for incident persistence."""
@@ -133,6 +165,29 @@ class IncidentRepository(Protocol):
 
         ``updated_at`` is the time of the last state transition, so for ``AWAITING_APPROVAL``
         it is when approval started. Excludes the system pseudo-incident.
+        """
+        ...
+
+    async def reconcile_stale_inflight(self, stale_seconds: int) -> list[ReclaimedIncident]:
+        """Atomically fail ``TRIAGING``/``EXECUTING`` rows with ``updated_at <= now - stale_seconds``.
+
+        Fresher in-flight rows (possibly owned by a live worker) are untouched.
+        """
+        ...
+
+    async def expire_stale_awaiting(self, ttl_seconds: float) -> list[ReclaimedIncident]:
+        """Atomically expire ``AWAITING_APPROVAL`` rows with ``updated_at <= now - ttl_seconds``.
+
+        "now" is the store's clock (database ``now()`` in Postgres).
+        """
+        ...
+
+    async def expire_if_stale(self, token: str, ttl_seconds: float) -> ExpiryOutcome:
+        """Point-of-use expiry check for the active incident holding ``token``.
+
+        Expiry is decided by the store clock. An expired ``AWAITING_APPROVAL`` row is
+        moved to ``EXPIRED`` atomically, so concurrent callers see ``expired_now``
+        True at most once.
         """
         ...
 
@@ -267,6 +322,63 @@ class InMemoryIncidentRepository:
         self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": self._clock()})
         return True
 
+    async def reconcile_stale_inflight(self, stale_seconds: int) -> list[ReclaimedIncident]:
+        # No await between scan and write: atomic on the event loop.
+        now = self._clock()
+        cutoff = now - timedelta(seconds=stale_seconds)
+        reclaimed: list[ReclaimedIncident] = []
+        for incident_id, row in list(self._rows.items()):
+            if row.state in ("TRIAGING", "EXECUTING") and row.updated_at <= cutoff:
+                self._rows[incident_id] = row.model_copy(update={"state": "FAILED", "updated_at": now})
+                reclaimed.append(
+                    ReclaimedIncident(
+                        incident_id=incident_id,
+                        token=row.token,
+                        service_name=row.service_name,
+                        error_code=row.error_code,
+                    )
+                )
+        return reclaimed
+
+    async def expire_stale_awaiting(self, ttl_seconds: float) -> list[ReclaimedIncident]:
+        # No await between scan and write: atomic on the event loop.
+        now = self._clock()
+        cutoff = now - timedelta(seconds=ttl_seconds)
+        expired: list[ReclaimedIncident] = []
+        for incident_id, row in list(self._rows.items()):
+            if row.state == "AWAITING_APPROVAL" and row.updated_at <= cutoff:
+                self._rows[incident_id] = row.model_copy(update={"state": "EXPIRED", "updated_at": now})
+                expired.append(
+                    ReclaimedIncident(
+                        incident_id=incident_id,
+                        token=row.token,
+                        service_name=row.service_name,
+                        error_code=row.error_code,
+                    )
+                )
+        return expired
+
+    async def expire_if_stale(self, token: str, ttl_seconds: float) -> ExpiryOutcome:
+        # No await between read and write: atomic on the event loop.
+        row = next(
+            (r for r in self._rows.values() if r.token == token and r.state in ACTIVE_STATUSES), None
+        )
+        if row is None:
+            return ExpiryOutcome(found=False)
+        now = self._clock()
+        is_expired = row.updated_at <= now - timedelta(seconds=ttl_seconds)
+        expired_now = is_expired and row.state == "AWAITING_APPROVAL"
+        if expired_now:
+            self._rows[row.incident_id] = row.model_copy(update={"state": "EXPIRED", "updated_at": now})
+        return ExpiryOutcome(
+            found=True,
+            incident_id=row.incident_id,
+            state_before=row.state,
+            expired_now=expired_now,
+            is_expired=is_expired,
+            service_name=row.service_name,
+            error_code=row.error_code,
+        )
 
     async def record_resolution(
         self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None

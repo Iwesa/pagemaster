@@ -750,7 +750,7 @@ def test_property_10_reply_expiry_vs_ttl(age: int, choice: str) -> None:
         clock.advance(age)
         await reply(services, f"{incident.token}-{choice}")
         state = await state_of(services, incident.incident_id)
-        if age > TTL:
+        if age >= TTL:  # store clock: updated_at <= now - ttl
             assert state == "EXPIRED"
             assert graph.calls == []  # no infrastructure mutation
             assert (await events_of(services, incident.incident_id))[-1] == "INCIDENT_EXPIRED"
@@ -768,8 +768,8 @@ _P10_STATES = st.sampled_from(
 
 
 @settings(max_examples=200, deadline=None)
-@given(states=st.lists(_P10_STATES, min_size=0, max_size=10))
-def test_property_10_reconcile_orphans_moves_exactly_active_orphans(states: list[str]) -> None:
+@given(rows=st.lists(st.tuples(_P10_STATES, st.integers(min_value=0, max_value=40)), min_size=0, max_size=10))
+def test_property_10_reconcile_orphans_moves_exactly_stale_inflight(rows: list[tuple[str, int]]) -> None:
     """**Validates: Requirements 6.4, 6.5**"""
     from typing import cast
     from uuid import uuid4
@@ -779,29 +779,161 @@ def test_property_10_reconcile_orphans_moves_exactly_active_orphans(states: list
     from backend.tests.test_expiry import add_incident, events_of, make_services, state_of
 
     async def scenario() -> None:
-        services, _, graph = make_services()
-        seeded = [
-            (
-                await add_incident(
-                    services, cast(IncidentStatus, state), token=f"T{i}", service=f"svc-{i}"
-                ),
-                state,
-                f"svc-{i}",
-            )
-            for i, state in enumerate(states)
-        ]
-        orphans = sum(1 for s in states if s in ("TRIAGING", "EXECUTING"))
-        assert await services.lifecycle.reconcile_orphans() == orphans
-        for incident, before, svc in seeded:
+        services, clock, graph = make_services()
+        stale_after = services.inflight_stale_seconds
+        seeded = []
+        for i, (state, gap) in enumerate(rows):
+            clock.advance(gap)  # gaps make earlier incidents older
+            incident = await add_incident(services, cast(IncidentStatus, state), token=f"T{i}", service=f"svc-{i}")
+            seeded.append((incident, state, f"svc-{i}", clock.now))
+        clock.advance(stale_after // 2)
+
+        def is_stale(state: str, seeded_at: datetime) -> bool:
+            return state in ("TRIAGING", "EXECUTING") and (clock.now - seeded_at).total_seconds() >= stale_after
+
+        expected = sum(1 for _, s, _, at in seeded if is_stale(s, at))
+        assert await services.lifecycle.reconcile_orphans() == expected
+        for incident, before, svc, at in seeded:
             after = await state_of(services, incident.incident_id)
-            reconciled = "INCIDENT_RECONCILED" in await events_of(services, incident.incident_id)
+            failed = "INCIDENT_FAILED" in await events_of(services, incident.incident_id)
             probe = await services.dedup.acquire(svc, "E1", uuid4())
-            if before in ("TRIAGING", "EXECUTING"):
-                assert after == "FAILED" and reconciled
+            if is_stale(before, at):
+                assert after == "FAILED" and failed
                 assert isinstance(probe, Acquired)  # lock released
             else:
-                assert after == before and not reconciled
+                assert after == before and not failed
                 assert isinstance(probe, Duplicate)  # untouched, lock still held
         assert graph.calls == []
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 11: stale-lease reconciliation (Req 6.4)
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+from backend.app.services.incident_store import ALL_STATUSES, InMemoryIncidentRepository  # noqa: E402
+
+_P11_STATES = sorted(ALL_STATUSES)
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    rows=st.lists(
+        st.tuples(st.sampled_from(_P11_STATES), st.integers(min_value=0, max_value=300)),
+        max_size=12,
+    ),
+    cutoff=st.integers(min_value=10, max_value=300),
+)
+def test_property_11_reconcile_fails_exactly_stale_inflight(
+    rows: list[tuple[str, int]], cutoff: int
+) -> None:
+    """**Validates: Requirements 6.4**"""
+
+    async def scenario() -> None:
+        t0 = datetime(2025, 1, 1, tzinfo=UTC)
+        now = t0 + timedelta(seconds=1000)
+        clock = {"t": t0}
+        repo = InMemoryIncidentRepository(lambda: clock["t"])
+        expected: dict[UUID, str] = {}
+        stale: set[UUID] = set()
+        for i, (state, age) in enumerate(rows):
+            iid = UUID(int=i + 1)
+            clock["t"] = now - timedelta(seconds=age)
+            await repo.create(
+                incident_id=iid, token=f"{i // 36}{'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'[i % 36]}",
+                service_name=f"svc{i}", error_code="E", raw_alert={},
+            )
+            if state != "TRIAGING":
+                await repo.set_state(iid, state)  # type: ignore[arg-type]
+            if state in ("TRIAGING", "EXECUTING") and age >= cutoff:
+                stale.add(iid)
+                expected[iid] = "FAILED"
+            else:
+                expected[iid] = state
+        clock["t"] = now
+        reclaimed = await repo.reconcile_stale_inflight(cutoff)
+        assert {r.incident_id for r in reclaimed} == stale
+        assert len(reclaimed) == len(stale)
+        for iid, state in expected.items():
+            row = await repo.get(iid)
+            assert row is not None and row.state == state
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 12: header-only callback secret (Req 4.2, 4.3)
+# The first available source (X-Webhook-Secret, Authorization: Bearer, ?secret= only when
+# allowed) is the only one compared; a wrong higher-priority source is never rescued.
+# ---------------------------------------------------------------------------
+
+from backend.app.services.africastalking_client import extract_webhook_secret  # noqa: E402
+
+_P12_SECRET = "p12-secret"
+_p12_values = st.sampled_from([_P12_SECRET, "wrong", "", None])
+_p12_bearer = st.sampled_from(
+    [
+        f"Bearer {_P12_SECRET}",
+        f"bEaReR {_P12_SECRET}",
+        f"Bearer  {_P12_SECRET}",  # two spaces: malformed
+        f"Basic {_P12_SECRET}",
+        "Bearer wrong",
+        "Bearer ",
+        "Bearer",
+        "",
+        None,
+    ]
+)
+
+
+def _p12_model(header: str | None, bearer: str | None, query: str | None, allow: bool) -> str | None:
+    if header:
+        return header
+    if bearer is not None and bearer.lower().startswith("bearer ") and bearer[7:] and not bearer[7].isspace():
+        return bearer[7:]
+    if allow and query:
+        return query
+    return None
+
+
+@settings(max_examples=200, deadline=None)
+@given(header=_p12_values, bearer=_p12_bearer, query=_p12_values, allow=st.booleans())
+def test_property_12_extract_returns_first_available_source(
+    header: str | None, bearer: str | None, query: str | None, allow: bool
+) -> None:
+    """**Validates: Requirements 4.2, 4.3**"""
+    assert extract_webhook_secret(header, bearer, query, allow_query=allow) == _p12_model(
+        header, bearer, query, allow
+    )
+
+
+@settings(max_examples=200, deadline=None)
+@given(header=_p12_values, bearer=_p12_bearer, query=_p12_values, allow=st.booleans())
+def test_property_12_route_accepts_only_when_selected_source_matches(
+    header: str | None, bearer: str | None, query: str | None, allow: bool
+) -> None:
+    """**Validates: Requirements 4.2, 4.3**"""
+    at = AfricasTalkingSettings(webhook_secret=SecretStr(_P12_SECRET), to_number=_P8_ONCALL, shortcode="")
+    svc = build_in_memory_services(Settings(use_in_memory=True, africastalking=at, allow_query_secret=allow))
+    with TestClient(create_app(svc, Settings(frontend_dir=None))) as client:
+        alert = {"service_name": "auth-db", "error_code": "DB_POOL_EXHAUSTED", "summary": "x"}
+        incident_id = UUID(client.post("/webhooks/alerts", json=alert).json()["incident_id"])
+        record = asyncio.run(svc.incidents.get(incident_id))
+        assert record is not None
+        headers: dict[str, str] = {}
+        if header is not None:
+            headers["X-Webhook-Secret"] = header
+        if bearer is not None:
+            headers["Authorization"] = bearer
+        params = {"secret": query} if query is not None else {}
+        form = {"from": _P8_ONCALL, "to": "", "text": f"{record.token}-1", "date": "d", "id": "ATXid_p12", "linkId": "l"}
+        resp = client.post("/webhooks/africastalking/sms", data=form, headers=headers, params=params)
+        after = asyncio.run(svc.incidents.get(incident_id))
+        assert after is not None
+        if _p12_model(header, bearer, query, allow) == _P12_SECRET:
+            assert resp.status_code == 200 and after.state == "RESOLVED"
+        else:
+            assert resp.status_code == 403 and after.state == "AWAITING_APPROVAL"

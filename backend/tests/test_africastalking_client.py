@@ -19,6 +19,7 @@ from backend.app.services.africastalking_client import (
     PagerInvariantError,
     SmsSendError,
     canonicalize_e164,
+    extract_webhook_secret,
 )
 
 MSG = "INC-AB Svc db down. Reply 1 Restart, 2 Ignore"
@@ -199,3 +200,49 @@ def test_canonicalize_e164_idempotent(raw: str) -> None:
     once = canonicalize_e164(raw)
     if once is not None:
         assert canonicalize_e164(once) == once
+
+
+# ---------------------------------------------------------------------------
+# extract_webhook_secret (task 15.3; Property 12 covers the model-based check)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_header_wins_over_bearer_and_query() -> None:
+    assert extract_webhook_secret("hdr", "Bearer bear", "qry", allow_query=True) == "hdr"
+
+
+def test_extract_bearer_used_when_header_absent_or_empty() -> None:
+    assert extract_webhook_secret(None, "Bearer bear", "qry", allow_query=True) == "bear"
+    assert extract_webhook_secret("", "Bearer bear", None, allow_query=False) == "bear"
+
+
+@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER", "bEaReR"])
+def test_extract_bearer_scheme_is_case_insensitive(scheme: str) -> None:
+    assert extract_webhook_secret(None, f"{scheme} tok", None, allow_query=False) == "tok"
+
+
+@pytest.mark.parametrize(
+    "auth", ["Bearer", "Bearer ", "bearer  tok", "Bearer\ttok", "Basic x", "Bearertok", " Bearer tok", "tok", ""]
+)
+def test_extract_malformed_bearer_is_ignored(auth: str) -> None:
+    assert extract_webhook_secret(None, auth, None, allow_query=False) is None
+    # Ignored means absent, so an enabled query secret is then used.
+    assert extract_webhook_secret(None, auth, "qry", allow_query=True) == "qry"
+
+
+def test_extract_empty_header_is_absent() -> None:
+    assert extract_webhook_secret("", None, None, allow_query=False) is None
+    assert extract_webhook_secret("", None, "qry", allow_query=True) == "qry"
+
+
+def test_extract_query_ignored_unless_allowed() -> None:
+    assert extract_webhook_secret(None, None, "qry", allow_query=False) is None
+    assert extract_webhook_secret(None, None, "qry", allow_query=True) == "qry"
+    assert extract_webhook_secret(None, None, "", allow_query=True) is None
+    assert extract_webhook_secret(None, None, None, allow_query=True) is None
+
+
+def test_extract_wrong_higher_priority_source_does_not_fall_through() -> None:
+    # The extractor returns the higher-priority value as is; it never substitutes the valid lower one.
+    assert extract_webhook_secret("wrong", "Bearer right", "right", allow_query=True) == "wrong"
+    assert extract_webhook_secret(None, "Bearer wrong", "right", allow_query=True) == "wrong"

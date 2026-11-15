@@ -13,14 +13,19 @@
   ``OPENAI_API_KEY``
   ``REDIS_URL``         Redis for the dedup lock.
   ``AFRICASTALKING_*``  username, API key, shortcode, webhook secret (``X-Webhook-Secret``
-                        header or ``?secret=``; unset rejects all inbound SMS), plus
+                        header or ``Authorization: Bearer``; unset rejects all inbound SMS), plus
                         ``ONCALL_PHONE_NUMBER`` (the only accepted reply sender).
-  ``PUBLIC_BASE_URL``   no longer used for signatures; kept for compatibility.
+  ``PUBLIC_BASE_URL``   no longer used for signatures; kept for compatibility. A warning
+                        is logged at startup if it contains a ``?`` query string.
+  ``ALLOW_QUERY_SECRET`` ``true``/``1``/``yes`` (case-insensitive) permits the legacy
+                        ``?secret=`` webhook auth; default false (header-only). Warns when on.
   ``ALERT_WEBHOOK_SECRET`` optional; when set, ``POST /webhooks/alerts`` requires
                         ``Authorization: Bearer <secret>`` (401 otherwise).
   ``FRONTEND_DIR``      static UI directory (default ``<repo>/frontend``).
   ``APPROVAL_TTL_SECONDS`` seconds an incident may await approval before it expires (900).
   ``REAPER_INTERVAL_SECONDS`` how often the background reaper looks for expired approvals (30).
+  ``INFLIGHT_STALE_SECONDS`` age before a TRIAGING/EXECUTING incident is reconciled to FAILED
+                        at startup (60, minimum 10; bad values fall back to 60).
   ``DRY_RUN``           default true; registers ``/api/demo/*`` (simulated replies, outbox).
   ===================== ==========================================================
 
@@ -64,6 +69,31 @@ logger = logging.getLogger("pagemaster.main")
 _TRUE_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 
 
+_QUERY_SECRET_TRUE_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes"})
+
+MIN_INFLIGHT_STALE_SECONDS: Final[int] = 10
+DEFAULT_INFLIGHT_STALE_SECONDS: Final[int] = 60
+
+
+def _parse_inflight_stale_seconds(raw: str | None) -> int:
+    """Parse ``INFLIGHT_STALE_SECONDS``: clamp to the minimum, fall back on bad input."""
+    if raw is None:
+        return DEFAULT_INFLIGHT_STALE_SECONDS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "invalid INFLIGHT_STALE_SECONDS; using default %d", DEFAULT_INFLIGHT_STALE_SECONDS
+        )
+        return DEFAULT_INFLIGHT_STALE_SECONDS
+    if value < MIN_INFLIGHT_STALE_SECONDS:
+        logger.warning(
+            "INFLIGHT_STALE_SECONDS below minimum; clamped to %d", MIN_INFLIGHT_STALE_SECONDS
+        )
+        return MIN_INFLIGHT_STALE_SECONDS
+    return value
+
+
 class Settings(BaseModel):
     """Environment-driven configuration."""
 
@@ -82,6 +112,8 @@ class Settings(BaseModel):
     frontend_dir: Path | None = None
     approval_ttl_seconds: int = Field(default=900, gt=0)
     reaper_interval_seconds: float = Field(default=30.0, gt=0)
+    inflight_stale_seconds: int = Field(default=60, ge=MIN_INFLIGHT_STALE_SECONDS)
+    allow_query_secret: bool = False  # legacy opt-in for ?secret= on the SMS webhook
     dry_run: bool = False  # enables the demo routes; from_env defaults to True like AfricasTalkingSettings
 
     @classmethod
@@ -102,6 +134,9 @@ class Settings(BaseModel):
             frontend_dir=Path(frontend) if frontend else None,
             approval_ttl_seconds=int(source.get("APPROVAL_TTL_SECONDS", "900") or "900"),
             reaper_interval_seconds=float(source.get("REAPER_INTERVAL_SECONDS", "30") or "30"),
+            inflight_stale_seconds=_parse_inflight_stale_seconds(source.get("INFLIGHT_STALE_SECONDS")),
+            allow_query_secret=source.get("ALLOW_QUERY_SECRET", "").strip().lower()
+            in _QUERY_SECRET_TRUE_VALUES,
             dry_run=source.get("DRY_RUN", "true").strip().lower() in (_TRUE_VALUES | {""}),
         )
 
@@ -134,8 +169,10 @@ def build_in_memory_services(settings: Settings) -> AppServices:
         africastalking_shortcode=settings.africastalking.shortcode,
         seen_ids=InMemorySeenIdStore(),
         alert_webhook_secret=settings.alert_webhook_secret,
+        allow_query_secret=settings.allow_query_secret,
         reseed=reseed_noop,
         approval_ttl_seconds=settings.approval_ttl_seconds,
+        inflight_stale_seconds=settings.inflight_stale_seconds,
     )
 
 
@@ -146,6 +183,7 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> AppS
 
     from backend.app.mcp.server import TelemetryStore, reseed_recent_logs
     from backend.app.services.dedup import RedisDedupStore
+    from backend.app.services.leader_lock import RedisReconcileLock
     from backend.app.services.seen_ids import RedisSeenIdStore
     from backend.app.services.postgres_store import (
         PostgresAuditStore,
@@ -223,9 +261,12 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> AppS
         africastalking_shortcode=settings.africastalking.shortcode,
         seen_ids=RedisSeenIdStore(redis),
         alert_webhook_secret=settings.alert_webhook_secret,
+        allow_query_secret=settings.allow_query_secret,
         reseed=reseed,
         ping=ping,
+        reconcile_lock=RedisReconcileLock(redis),
         approval_ttl_seconds=settings.approval_ttl_seconds,
+        inflight_stale_seconds=settings.inflight_stale_seconds,
     )
 
 
@@ -241,6 +282,16 @@ def create_app(
     cfg = settings if settings is not None else Settings.from_env()
     if not cfg.dry_run and not cfg.alert_webhook_secret:
         logger.warning("ALERT_WEBHOOK_SECRET is not set: POST /webhooks/alerts is unauthenticated")
+    if cfg.public_base_url and "?" in cfg.public_base_url:
+        logger.warning(
+            "PUBLIC_BASE_URL contains a query string; secrets in URLs leak into proxy logs. "
+            "Send the webhook secret in the X-Webhook-Secret header instead"
+        )
+    if cfg.allow_query_secret:
+        logger.warning(
+            "ALLOW_QUERY_SECRET is enabled: the webhook secret may be sent as ?secret=, "
+            "which leaks into proxy and access logs. Prefer the X-Webhook-Secret header"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -252,11 +303,13 @@ def create_app(
             else:
                 app.state.services = await build_real_services(cfg, stack)
             lifecycle = app.state.services.lifecycle
-            # Req 6.4: orphaned TRIAGING/EXECUTING incidents fail before we serve traffic.
+            # Req 6.4: stale TRIAGING/EXECUTING incidents fail before we serve traffic.
+            # One worker reconciles at a time (optional Redis leader lock); the lock is
+            # released inside startup_reconcile once the run finishes.
             try:
-                count = await lifecycle.reconcile_orphans()
+                count = await lifecycle.startup_reconcile(app.state.services.reconcile_lock)
                 if count:
-                    logger.warning("reconciled %d orphaned incidents to FAILED", count)
+                    logger.warning("reconciled %d stale in-flight incidents to FAILED", count)
             except Exception:
                 logger.exception("startup reconciliation failed")
             reaper = asyncio.create_task(lifecycle.run_reaper(cfg.reaper_interval_seconds), name="approval-reaper")

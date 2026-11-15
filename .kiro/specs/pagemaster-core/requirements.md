@@ -36,7 +36,7 @@ Pagemaster is an event-driven, two-way incident response system that triages clo
 
 #### Acceptance Criteria
 1. WHEN a pager payload passes Supervisor validation THE SYSTEM SHALL dispatch the SMS via Africa's Talking (or local mock transport in `DRY_RUN=true` mode), persist the LangGraph checkpoint in PostgreSQL, and transition the incident state to `AWAITING_APPROVAL`.
-2. WHEN Africa's Talking posts a reply to `POST /webhooks/africastalking/sms` THE SYSTEM SHALL verify the shared secret `AFRICASTALKING_WEBHOOK_SECRET` (constant-time comparison) before parsing the message body.
+2. WHEN Africa's Talking posts a reply to `POST /webhooks/africastalking/sms` THE SYSTEM SHALL verify the shared secret `AFRICASTALKING_WEBHOOK_SECRET` (constant-time comparison) before parsing the message body. The secret SHALL be read from the `X-Webhook-Secret` header, then from `Authorization: Bearer <secret>`; a `?secret=` query parameter SHALL be ignored unless `ALLOW_QUERY_SECRET=true`.
 3. IF the webhook secret is invalid THEN THE SYSTEM SHALL reject the request with HTTP `403 Forbidden` and log a `SECURITY_VIOLATION` audit event.
 4. IF the sender (`from`) of a reply, after canonicalization to E.164, does not equal `ONCALL_PHONE_NUMBER`, or the destination (`to`) does not equal the configured shortcode when one is set, THEN THE SYSTEM SHALL reject the request with HTTP `403 Forbidden`, log a `SECURITY_VIOLATION` audit event, and perform zero state changes.
 5. WHEN Africa's Talking redelivers a reply with a message `id` that was already processed THE SYSTEM SHALL ignore the duplicate and perform zero additional state changes.
@@ -62,8 +62,10 @@ Pagemaster is an event-driven, two-way incident response system that triages clo
 1. WHEN an incident has been in `AWAITING_APPROVAL` for longer than `APPROVAL_TTL_SECONDS` THE SYSTEM SHALL transition it to `EXPIRED`, append an audit event, and release the fingerprint lock.
 2. IF a reply arrives for an incident whose approval window has elapsed THEN THE SYSTEM SHALL treat it as expired, perform zero infrastructure mutations, and reply that the incident is no longer active.
 3. WHILE the application is running THE SYSTEM SHALL run a background reaper that applies criterion 1 periodically.
-4. WHEN the application starts THE SYSTEM SHALL transition every orphaned `TRIAGING` or `EXECUTING` incident to `FAILED`, append an audit event, and release its fingerprint lock.
+4. WHEN the application starts THE SYSTEM SHALL transition every `TRIAGING` or `EXECUTING` incident whose `updated_at` is older than `INFLIGHT_STALE_SECONDS` (default 60, minimum 10) to `FAILED`, append an `INCIDENT_FAILED` audit event with reason `stale_inflight_reconciled`, and release its fingerprint lock. Fresh in-flight incidents (possibly owned by another live worker) SHALL NOT be touched.
 5. THE SYSTEM SHALL treat `EXPIRED` as a terminal state that is excluded from the active-fingerprint and active-token uniqueness constraints.
+6. WHERE a Redis leader lock is available THE SYSTEM SHALL take `pagemaster:reconcile_lock` (`NX`, 30 second TTL) before reconciling so that concurrently booting workers do not reconcile at the same time.
+7. THE SYSTEM SHALL evaluate approval expiry against the PostgreSQL clock (`now()`), not the application clock, when a PostgreSQL repository is used, and SHALL expire a stale incident atomically before any LangGraph resume.
 
 ### Requirement 7: Operability
 **User Story:** As an operator, I want health checks and a locked-down default deployment so that the stack is safe to run outside a laptop.

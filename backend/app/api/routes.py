@@ -26,11 +26,16 @@ from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from backend.app.agents.ports import SmsPort
-from backend.app.services.africastalking_client import AfricasTalkingSmsAdapter, canonicalize_e164
+from backend.app.services.africastalking_client import (
+    AfricasTalkingSmsAdapter,
+    canonicalize_e164,
+    extract_webhook_secret,
+)
 from backend.app.services.sms_common import OutboxMessage
+from backend.app.services.leader_lock import ReconcileLock
 from backend.app.services.seen_ids import InMemorySeenIdStore, SeenIdStore
 from backend.app.services.dedup import DedupStore, Duplicate, release_on_terminal
-from backend.app.services.lifecycle import DEFAULT_APPROVAL_TTL_SECONDS, Lifecycle, approval_expired, utc_now
+from backend.app.services.lifecycle import DEFAULT_APPROVAL_TTL_SECONDS, Lifecycle, utc_now
 from backend.app.services.guardrails import (
     AuditEvent,
     AuditRecord,
@@ -91,12 +96,18 @@ class AppServices:
     africastalking_shortcode: str = ""
     seen_ids: SeenIdStore = field(default_factory=InMemorySeenIdStore)
     alert_webhook_secret: str = ""
+    #: Legacy opt-in: also accept the webhook secret as ``?secret=`` (default header-only).
+    allow_query_secret: bool = False
     #: Refreshes demo telemetry rows (returns rows touched). ``None`` = nothing to refresh.
     reseed: Callable[[], Awaitable[int]] | None = None
     #: Cheap dependency probe for ``/healthz``; raises on failure. ``None`` = always ready.
     ping: Callable[[], Awaitable[None]] | None = None
     #: Seconds an incident may wait in ``AWAITING_APPROVAL`` before it expires.
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS
+    #: Age (seconds) after which TRIAGING/EXECUTING incidents count as orphaned (Req 6.4).
+    inflight_stale_seconds: int = 60
+    #: Optional leader lock for startup reconciliation (``None`` = single process, no lock).
+    reconcile_lock: ReconcileLock | None = None
     #: Time source for expiry checks (injectable for tests).
     clock: Callable[[], datetime] = utc_now
 
@@ -109,6 +120,7 @@ class AppServices:
             sms=self.sms,
             approval_ttl_seconds=self.approval_ttl_seconds,
             clock=self.clock,
+            inflight_stale_seconds=self.inflight_stale_seconds,
         )
 
 
@@ -413,8 +425,17 @@ def authorize_inbound_sms(
         return "shortcode_mismatch"
     return None
 
-async def _reject_sms(request: Request, services: AppServices, reason: str, sender: str | None) -> None:
+async def _reject_sms(
+    request: Request,
+    services: AppServices,
+    reason: str,
+    sender: str | None,
+    *,
+    query_secret_disabled: bool = False,
+) -> None:
     payload: dict[str, Any] = {"reason": reason, "path": request.url.path}
+    if query_secret_disabled:
+        payload["query_secret_disabled"] = True
     if sender is not None:
         payload["sender"] = _mask_sender(sender)
     try:
@@ -444,12 +465,19 @@ async def africastalking_sms(request: Request, background: BackgroundTasks, serv
         raise HTTPException(status_code=413, detail="payload too large")
 
     # (1) Shared secret first: no body field is interpreted before it is accepted.
-    reason = secret_violation(
-        services.africastalking_webhook_secret,
-        (request.headers.get("X-Webhook-Secret", ""), request.query_params.get("secret", "")),
+    # Only the first available source is compared (header, bearer, then opt-in query).
+    query_secret = request.query_params.get("secret")
+    selected = extract_webhook_secret(
+        request.headers.get("X-Webhook-Secret"),
+        request.headers.get("Authorization"),
+        query_secret,
+        allow_query=services.allow_query_secret,
     )
+    supplied: tuple[str, ...] = (selected,) if selected else ()
+    reason = secret_violation(services.africastalking_webhook_secret, supplied)
     if reason is not None:
-        await _reject_sms(request, services, reason, None)
+        ignored = bool(query_secret) and not services.allow_query_secret
+        await _reject_sms(request, services, reason, None, query_secret_disabled=ignored)
 
     form = dict(parse_qsl(raw.decode("utf-8", errors="replace"), keep_blank_values=True))
     sender = form.get("from", "")
@@ -457,7 +485,7 @@ async def africastalking_sms(request: Request, background: BackgroundTasks, serv
     # (2) sender == ONCALL_PHONE_NUMBER and (3) optional shortcode match.
     violation = authorize_inbound_sms(
         expected_secret=services.africastalking_webhook_secret,
-        supplied_secrets=(request.headers.get("X-Webhook-Secret", ""), request.query_params.get("secret", "")),
+        supplied_secrets=supplied,
         sender=sender,
         to=form.get("to", ""),
         oncall_phone_number=services.oncall_phone_number,
@@ -486,18 +514,17 @@ async def _handle_reply(services: AppServices, background: BackgroundTasks, body
     if reply is None:
         return  # not an action code: ignore, no mutation
 
-    incident = await services.incidents.get_active_by_token(reply.token)
+    # Req 6.1, 6.2, 6.7: the store clock decides expiry, before any graph resume.
+    outcome = await services.incidents.expire_if_stale(reply.token, services.approval_ttl_seconds)
+    if outcome.expired_now:
+        await services.lifecycle.handle_expiry(outcome, reply.token)  # audit + unlock + SMS
+        return
+    incident = (
+        await services.incidents.get_active_by_token(reply.token) if outcome.found else None
+    )
     if incident is None:  # Req 4.5: unknown, expired or resolved
         await _notify(services, f"INC-{reply.token} no longer active. No action taken.")
         return
-
-    # Req 6.2: an elapsed approval window expires the incident; the graph is never resumed.
-    if approval_expired(incident, services.clock(), services.approval_ttl_seconds):
-        if await services.lifecycle.expire(incident):
-            return
-        await _notify(services, f"INC-{reply.token} is not awaiting approval. No action taken.")
-        return
-
     claimed = await services.incidents.compare_and_set_state(
         incident.incident_id, "AWAITING_APPROVAL", "EXECUTING"
     )

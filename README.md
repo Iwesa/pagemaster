@@ -7,8 +7,8 @@ Two-way incident response over SMS, reviving 1990s Motorola Advisor paging for m
 1. **Atomic Ingestion & Deduplication:** `POST /webhooks/alerts` validates the payload, deduplicates it in Redis by `(service_name, error_code)` (`SET ... NX EX 300`), and starts a LangGraph run (`202 Accepted`). Duplicate active alerts return `200 OK` (`DEDUPLICATED`).
 2. **Read-Only MCP Triage:** The triage worker queries recent error logs, service topology, and approved runbooks through a FastMCP server over `stdio`. If MCP is unreachable or exceeds 5 seconds, triage degrades gracefully with `confidence="DEGRADED"`.
 3. **Supervisor Compression & PII Clamp:** The supervisor summarizes the root cause (via Gemini or OpenAI when an API key is configured, otherwise a deterministic fallback). `format_pager_payload` clamps the output to `<= 160` GSM-7 septets (ASCII only, no UCS-2 fallback), prefixes `INC-<TOKEN>`, and strips emails, IPv4/IPv6 addresses, JWTs, and bearer tokens.
-4. **Durable Human-in-the-Loop Gate:** The LangGraph workflow suspends via `interrupt()` in `AWAITING_APPROVAL`, persisting its checkpoint in PostgreSQL. An approval that is not answered within `APPROVAL_TTL_SECONDS` becomes `EXPIRED`, and orphaned `TRIAGING`/`EXECUTING` incidents are moved to `FAILED` on startup.
-5. **Authenticated Two-Way SMS Reply:** Africa's Talking posts the engineer's reply to `POST /webhooks/africastalking/sms`. The shared secret (`X-Webhook-Secret` header or `?secret=`), the E.164 sender (must equal `ONCALL_PHONE_NUMBER`), the optional shortcode and the message `id` (idempotency) are all checked before any state change (`403 Forbidden` and a `SECURITY_VIOLATION` audit record on failure).
+4. **Durable Human-in-the-Loop Gate:** The LangGraph workflow suspends via `interrupt()` in `AWAITING_APPROVAL`, persisting its checkpoint in PostgreSQL. An approval that is not answered within `APPROVAL_TTL_SECONDS` becomes `EXPIRED`, and stale `TRIAGING`/`EXECUTING` incidents (not updated for `INFLIGHT_STALE_SECONDS`) are moved to `FAILED` on startup. Reconciliation leaves fresh in-flight incidents alone, so it is safe with multiple workers, and expiry is evaluated with the database clock.
+5. **Authenticated Two-Way SMS Reply:** Africa's Talking posts the engineer's reply to `POST /webhooks/africastalking/sms`. The shared secret (`X-Webhook-Secret` header or `Authorization: Bearer`; `?secret=` is ignored unless `ALLOW_QUERY_SECRET=true`), the E.164 sender (must equal `ONCALL_PHONE_NUMBER`), the optional shortcode and the message `id` (idempotency) are all checked before any state change (`403 Forbidden` and a `SECURITY_VIOLATION` audit record on failure).
 6. **Deterministic Tripwire Isolation:** `TripwireValidator` verifies that `target_host == incident.service_name` and that `action_id` is currently approved, re-querying the runbooks at execution time so a revocation after triage is honoured. Any mismatch trips the circuit breaker (`BLOCKED_BY_TRIPWIRE`) and aborts execution.
 7. **Four-Gate Resolution & Tamper-Evident Audit:** An incident transitions to `RESOLVED` only when `tripwire_check_passed`, `simulated_step_executed`, `confirmation_sms_sent`, and `audit_record_committed` are all `true`. Failed runs transition to `FAILED` and release the deduplication lock. Every state transition is appended to a SHA-256 hash-chained audit trail.
 
@@ -67,14 +67,30 @@ Open http://localhost:8000. With `DRY_RUN=true` (the default) no SMS is sent. Th
 | `ONCALL_PHONE_NUMBER` | On-call number in E.164. Pages go here and only replies from it are accepted | empty |
 | `APPROVAL_TTL_SECONDS` | Seconds before a pending approval expires (`EXPIRED`) | `900` |
 | `REAPER_INTERVAL_SECONDS` | Interval of the sweep that expires approvals | `30` |
+| `INFLIGHT_STALE_SECONDS` | Startup reconciliation fails only `TRIAGING`/`EXECUTING` incidents not updated for this long (minimum 10), so a booting worker does not kill another worker's live runs | `60` |
+| `ALLOW_QUERY_SECRET` | Also accept the webhook secret from the `?secret=` query parameter. Less secure: URLs appear in proxy and access logs | `false` |
 | `REDIS_PASSWORD` | Redis `requirepass`; embedded in the backend `REDIS_URL` | `pagemaster_redis_dev` |
 | `POSTGRES_PASSWORD`, `MCP_READER_PASSWORD` | Postgres and `mcp_reader` role passwords (the latter must match `database/init_mock_logs.sql`) | `pagemaster_dev`, `mcp_reader_dev` |
 
 ## Africa's Talking SMS
 
-Inbound replies arrive at `POST /webhooks/africastalking/sms` as form fields `from`, `to`, `text`, `date`, `id` and `linkId`. Send the secret in the `X-Webhook-Secret` header or the `?secret=` query parameter. The alert response never contains the reply token; it only appears in the pager SMS.
+Inbound replies arrive at `POST /webhooks/africastalking/sms` as form fields `from`, `to`, `text`, `date`, `id` and `linkId`. The secret is read from the `X-Webhook-Secret` header, then from `Authorization: Bearer <secret>`, and compared in constant time (`hmac.compare_digest`). Requests without a valid secret are rejected (fail closed). The `?secret=` query parameter is ignored unless `ALLOW_QUERY_SECRET=true`. The alert response never contains the reply token; it only appears in the pager SMS.
 
-To configure the callback in the Africa's Talking dashboard, open SMS, then SMS Callback URLs, then incoming messages, and enter `https://<your-host>/webhooks/africastalking/sms?secret=<AFRICASTALKING_WEBHOOK_SECRET>`. The dashboard cannot set custom headers, so use the query parameter. The server must be reachable from the internet, for example through a tunnel.
+To configure the callback in the Africa's Talking dashboard, open SMS, then SMS Callback URLs, then incoming messages, and enter `https://<your-host>/webhooks/africastalking/sms`. The server must be reachable from the internet, for example through a tunnel.
+
+The dashboard callback URL cannot attach custom headers. With the default `ALLOW_QUERY_SECRET=false` you therefore have two options:
+
+1. **Recommended:** route the callback through a reverse proxy or API gateway that injects the header. For example, with nginx:
+
+   ```nginx
+   location /webhooks/africastalking/sms {
+       proxy_set_header X-Webhook-Secret "<AFRICASTALKING_WEBHOOK_SECRET>";
+       proxy_pass http://backend:8000;
+   }
+   ```
+
+   Anyone who can reach the proxy can then post to this endpoint without the secret, so the E.164 sender check is the remaining control. Restrict the location to Africa's Talking source IPs where possible.
+2. **Explicit opt-in:** set `ALLOW_QUERY_SECRET=true` and use `https://<your-host>/webhooks/africastalking/sms?secret=<AFRICASTALKING_WEBHOOK_SECRET>`. This is less secure: the secret can appear in proxy and access logs. Rotate it regularly.
 
 Sandbox: with `AFRICASTALKING_USERNAME=sandbox` the app uses the sandbox endpoint. Sandbox messages go to the simulator, not to a real phone, and you can send replies from the simulator to the callback URL.
 

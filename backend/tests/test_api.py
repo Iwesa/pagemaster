@@ -172,10 +172,48 @@ def test_secret_unset_rejects_everything() -> None:
         assert [v["reason"] for v in _violations(svc)] == ["secret_not_configured"] * 2
 
 
-def test_secret_in_query_parameter_and_unconfigured_shortcode(client: TestClient) -> None:
+def _opted_in_services() -> AppServices:
+    return build_in_memory_services(Settings(use_in_memory=True, africastalking=_at_settings(), allow_query_secret=True))
+
+
+def test_query_secret_is_rejected_by_default_and_audited(client: TestClient, services: AppServices) -> None:
     token = _new_token(client)
-    assert _sms(client, f"{token}-2", query_secret=True).status_code == 200
+    assert _sms(client, f"{token}-2", query_secret=True).status_code == 403
+    assert _states(client) == {token: "AWAITING_APPROVAL"}
+    violations = _violations(services)
+    assert len(violations) == 1
+    assert violations[0]["reason"] == "invalid_secret" and violations[0]["query_secret_disabled"] is True
+    assert WH_SECRET not in str(violations)
+
+
+def test_query_secret_accepted_only_when_opted_in() -> None:
+    services = _opted_in_services()
+    with TestClient(create_app(services, Settings(frontend_dir=None))) as c:
+        token = _new_token(c)
+        assert _sms(c, f"{token}-2", query_secret=True).status_code == 200
+        assert _states(c) == {token: "RESOLVED"}
+
+
+def test_bearer_header_is_accepted(client: TestClient) -> None:
+    token = _new_token(client)
+    form = {"from": ONCALL, "to": SHORTCODE, "text": f"{token}-2", "id": "ATXid_bearer"}
+    resp = client.post(SMS_PATH, data=form, headers={"Authorization": f"bearer {WH_SECRET}"})
+    assert resp.status_code == 200
     assert _states(client) == {token: "RESOLVED"}
+
+
+def test_wrong_header_does_not_fall_through_to_valid_query_secret() -> None:
+    services = _opted_in_services()
+    with TestClient(create_app(services, Settings(frontend_dir=None))) as c:
+        token = _new_token(c)
+        form = {"from": ONCALL, "to": SHORTCODE, "text": f"{token}-1", "id": "ATXid_nofall"}
+        resp = c.post(
+            f"{SMS_PATH}?secret={WH_SECRET}",
+            data=form,
+            headers={"X-Webhook-Secret": "wrong", "Authorization": f"Bearer {WH_SECRET}"},
+        )
+        assert resp.status_code == 403
+        assert _states(c) == {token: "AWAITING_APPROVAL"}
 
 
 def test_duplicate_message_id_is_ignored(client: TestClient, services: AppServices) -> None:
@@ -444,3 +482,82 @@ def test_healthz_200_when_ping_succeeds(services: AppServices) -> None:
 
     with TestClient(create_app(dataclasses.replace(services, ping=fine), Settings(frontend_dir=None))) as c:
         assert c.get("/healthz").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Webhook secret transport (task 15.3)
+# ---------------------------------------------------------------------------
+
+
+def _sms_form(token: str, msg_id: str) -> dict[str, str]:
+    return {"from": ONCALL, "to": SHORTCODE, "text": f"{token}-1", "id": msg_id}
+
+
+def test_x_webhook_secret_header_is_accepted(client: TestClient) -> None:
+    token = _new_token(client)
+    resp = client.post(SMS_PATH, data=_sms_form(token, "ATXid_hdr"), headers={"X-Webhook-Secret": WH_SECRET})
+    assert resp.status_code == 200
+    assert _states(client) == {token: "RESOLVED"}
+
+
+def test_bearer_header_canonical_case_is_accepted(client: TestClient) -> None:
+    token = _new_token(client)
+    resp = client.post(
+        SMS_PATH, data=_sms_form(token, "ATXid_bear2"), headers={"Authorization": f"Bearer {WH_SECRET}"}
+    )
+    assert resp.status_code == 200
+    assert _states(client) == {token: "RESOLVED"}
+
+
+def test_wrong_bearer_is_rejected_and_audited_without_secret(client: TestClient, services: AppServices) -> None:
+    token = _new_token(client)
+    resp = client.post(SMS_PATH, data=_sms_form(token, "ATXid_bear3"), headers={"Authorization": "Bearer nope"})
+    assert resp.status_code == 403
+    assert _states(client) == {token: "AWAITING_APPROVAL"}
+    assert [v["reason"] for v in _violations(services)] == ["invalid_secret"]
+    assert "nope" not in str(_violations(services))
+
+
+def test_correct_query_secret_with_flag_off_leaves_state_and_audit_clean(
+    client: TestClient, services: AppServices
+) -> None:
+    token = _new_token(client)
+    outbox_before = _outbox(services)
+    resp = client.post(f"{SMS_PATH}?secret={WH_SECRET}", data=_sms_form(token, "ATXid_q403"))
+    assert resp.status_code == 403
+    assert _states(client) == {token: "AWAITING_APPROVAL"}
+    assert _outbox(services) == outbox_before
+    violations = _violations(services)
+    assert len(violations) == 1 and violations[0]["reason"] == "invalid_secret"
+    all_records = [r.payload for r in _run(services.audit.records(SYSTEM_INCIDENT_ID))]
+    assert WH_SECRET not in str(all_records)
+
+
+def _env(**extra: str) -> dict[str, str]:
+    return {
+        "USE_IN_MEMORY": "true",
+        "AFRICASTALKING_WEBHOOK_SECRET": WH_SECRET,
+        "ONCALL_PHONE_NUMBER": ONCALL,
+        "AFRICASTALKING_SHORTCODE": SHORTCODE,
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    ("env_extra", "query_status"),
+    [({}, 403), ({"ALLOW_QUERY_SECRET": "false"}, 403), ({"ALLOW_QUERY_SECRET": "true"}, 200)],
+)
+def test_allow_query_secret_env_drives_app_end_to_end(env_extra: dict[str, str], query_status: int) -> None:
+    cfg = Settings.from_env(_env(**env_extra))
+    assert cfg.allow_query_secret is (query_status == 200)
+    with TestClient(create_app(settings=cfg)) as c:  # services built from Settings (in-memory path)
+        token = _new_token(c)
+        resp = c.post(f"{SMS_PATH}?secret={WH_SECRET}", data=_sms_form(token, "ATXid_env_q"))
+        assert resp.status_code == query_status
+        expected = "RESOLVED" if query_status == 200 else "AWAITING_APPROVAL"
+        assert _states(c) == {token: expected}
+        if query_status == 403:
+            # Header auth still works regardless of the flag.
+            ok = c.post(SMS_PATH, data=_sms_form(token, "ATXid_env_h"), headers={"X-Webhook-Secret": WH_SECRET})
+            assert ok.status_code == 200
+            assert _states(c) == {token: "RESOLVED"}

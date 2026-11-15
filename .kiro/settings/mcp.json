@@ -4,9 +4,12 @@
       "command": "python",
       "args": ["-m", "backend.app.mcp.server"],
       "env": {
-        "DATABASE_URL": "${DATABASE_URL}"
+        "MCP_READER_DATABASE_URL": "postgresql://mcp_reader:mcp_reader_dev@127.0.0.1:5432/pagemaster"
       },
-      "disabled": false
+      "disabled": false,
+      "autoApprove": [
+        "fetch_incident_context"
+      ]
     }
   }
 }

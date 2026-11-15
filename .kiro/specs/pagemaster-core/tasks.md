@@ -65,3 +65,24 @@
     - _Requirements: 2.1, 2.2, 2.3, 3.1, 3.3_
   - [x] 11.4 API, compose and UI hardening: optional `ALERT_WEBHOOK_SECRET` bearer check on `POST /webhooks/alerts`; expose `PUBLIC_BASE_URL`, `USE_IN_MEMORY`, `ALERT_WEBHOOK_SECRET` in `docker-compose.yml`; add a NEXT button to `frontend/index.html` that cycles through `AWAITING_APPROVAL` incidents and binds `-1`/`-2` to the selected page; add a `.gitignore` covering `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.hypothesis/`; run `pytest backend/tests/ -v` and `mypy --strict backend/app` and fix failures.
     - _Requirements: 1.1, 1.3, 4.1, 4.4_
+
+  # Multi-Worker, DB-Clock Expiry & Webhook Auth Hardening
+
+- [x] 12. Make startup reconciliation multi-worker safe with a stale-lease cutoff
+  - [x] 12.1 Add `inflight_stale_seconds: int = 60` (read from `INFLIGHT_STALE_SECONDS`, minimum `10`) to `Settings` in `backend/app/main.py`.
+  - [x] 12.2 Update `reconcile_stale_inflight` in `backend/app/services/postgres_store.py` to atomically transition only stale rows via `UPDATE incidents SET state = 'FAILED', updated_at = now() WHERE state IN ('TRIAGING', 'EXECUTING') AND updated_at <= now() - make_interval(secs => $1) RETURNING incident_id, token, service_name, error_code`, and mirror the cutoff in `InMemoryIncidentRepository` (`backend/app/services/incident_store.py`).
+  - [x] 12.3 Update startup reconciliation in `backend/app/services/lifecycle.py` and `backend/app/main.py` to acquire an optional short-TTL Redis leader lock (`SET pagemaster:reconcile_lock <worker_id> NX EX 30`), release the `(service_name, error_code)` dedup lock for each reclaimed incident, and append an `INCIDENT_FAILED` audit record (`{"reason": "stale_inflight_reconciled"}`).
+
+- [x] 13. Evaluate incident approval expiry strictly against PostgreSQL database time
+  - [x] 13.1 Replace Python `datetime.now()` vs. `updated_at` comparisons in `backend/app/services/postgres_store.py` with SQL-side `updated_at <= now() - make_interval(secs => $1)` checks in both `expire_stale_awaiting(ttl_seconds)` and point-of-use `expire_if_stale(token, ttl_seconds)`, and compute `is_expired` inside SQL `SELECT` queries.
+  - [x] 13.2 Update `backend/app/services/lifecycle.py` and `backend/app/api/routes.py` so `POST /webhooks/africastalking/sms` and `POST /api/demo/reply` call `expire_if_stale` atomically before resuming LangGraph, freeing the dedup lock and appending `INCIDENT_EXPIRED` when expired.
+
+- [x] 14. Enforce header-based authentication on Africa's Talking callbacks by default
+  - [x] 14.1 Add `allow_query_secret: bool = False` (from `ALLOW_QUERY_SECRET`) to `Settings` in `backend/app/main.py`, and log a startup warning if `PUBLIC_BASE_URL` contains a `?` query string.
+  - [x] 14.2 Update `POST /webhooks/africastalking/sms` in `backend/app/api/routes.py` (and helpers in `backend/app/services/africastalking_client.py`) to read `X-Webhook-Secret` first, then `Authorization: Bearer <secret>`, and ignore `?secret=` unless `ALLOW_QUERY_SECRET=true`; validate with `hmac.compare_digest` and return `403 Forbidden` with a `SECURITY_VIOLATION` audit record on mismatch.
+  - [x] 14.3 Add `INFLIGHT_STALE_SECONDS=60` and `ALLOW_QUERY_SECRET=false` to `docker-compose.yml` and update `.kiro/steering/pagemaster-standards.md` and `README.md` to document header-only webhook authentication.
+
+- [x] 15. Switch `.kiro/settings/mcp.json` to `MCP_READER_DATABASE_URL` and add regression tests
+  - [x] 15.1 Update `.kiro/settings/mcp.json` so `pagemaster-telemetry` sets `MCP_READER_DATABASE_URL` instead of `DATABASE_URL`.
+  - [x] 15.2 Add tests in `backend/tests/test_expiry.py` and `backend/tests/test_postgres_integration.py` verifying that fresh `TRIAGING`/`EXECUTING` incidents younger than `INFLIGHT_STALE_SECONDS` are untouched on worker boot, stale ones transition to `FAILED` and free their dedup lock, and SQL-backdated `AWAITING_APPROVAL` rows expire using DB `now()` regardless of app clock skew.
+  - [x] 15.3 Add tests in `backend/tests/test_africastalking_client.py` and `backend/tests/test_api.py` verifying `?secret=` returns `403` when `ALLOW_QUERY_SECRET=false` while `X-Webhook-Secret` and `Authorization: Bearer` headers are accepted.

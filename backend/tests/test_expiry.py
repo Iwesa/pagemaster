@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 
@@ -15,6 +16,7 @@ from backend.app.api.routes import AppServices, _handle_reply
 from backend.app.main import Settings, build_in_memory_services, create_app
 from backend.app.services.africastalking_client import AfricasTalkingSmsAdapter
 from backend.app.services.dedup import Acquired, Duplicate
+from backend.app.services.leader_lock import InMemoryReconcileLock
 from backend.app.services.incident_store import (
     TERMINAL_STATUSES,
     InMemoryAuditStore,
@@ -189,10 +191,10 @@ async def test_reaper_survives_an_iteration_failure() -> None:
     services, clock, _ = make_services()
     incident = await add_incident(services, "AWAITING_APPROVAL")
     clock.advance(TTL + 1)
-    real = services.incidents.list_by_states
+    real = services.incidents.expire_stale_awaiting
     attempts = 0
 
-    async def flaky(*args: Any, **kwargs: Any) -> list[IncidentRecord]:
+    async def flaky(*args: Any, **kwargs: Any) -> list[ReclaimedIncident]:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -201,7 +203,7 @@ async def test_reaper_survives_an_iteration_failure() -> None:
 
     repo = services.incidents
     assert isinstance(repo, InMemoryIncidentRepository)
-    repo.list_by_states = flaky  # type: ignore[method-assign]
+    repo.expire_stale_awaiting = flaky  # type: ignore[method-assign]
     task = asyncio.create_task(services.lifecycle.run_reaper(0.01))
     try:
         for _ in range(200):
@@ -214,29 +216,206 @@ async def test_reaper_survives_an_iteration_failure() -> None:
     assert await state_of(services, incident.incident_id) == "EXPIRED"
 
 
-async def test_reconcile_fails_orphans_and_spares_awaiting_approval() -> None:
-    services, _, graph = make_services()
+STALE = 60  # AppServices.inflight_stale_seconds default
+
+
+async def test_reconcile_fails_stale_orphans_and_spares_awaiting_approval() -> None:
+    services, clock, graph = make_services()
     triaging = await add_incident(services, "TRIAGING", token="AA", service="svc-a")
     executing = await add_incident(services, "EXECUTING", token="BB", service="svc-b")
     awaiting = await add_incident(services, "AWAITING_APPROVAL", token="CC", service="svc-c")
+    clock.advance(STALE)
     assert await services.lifecycle.reconcile_orphans() == 2
     for orphan, svc in ((triaging, "svc-a"), (executing, "svc-b")):
         assert await state_of(services, orphan.incident_id) == "FAILED"
-        assert "INCIDENT_RECONCILED" in await events_of(services, orphan.incident_id)
+        events = await services.audit.records(orphan.incident_id)
+        assert events[-1].event_type == "INCIDENT_FAILED"
+        assert events[-1].payload == {"reason": "stale_inflight_reconciled"}
         assert isinstance(await services.dedup.acquire(svc, CODE, uuid4()), Acquired)
     assert await state_of(services, awaiting.incident_id) == "AWAITING_APPROVAL"
-    assert "INCIDENT_RECONCILED" not in await events_of(services, awaiting.incident_id)
+    assert "INCIDENT_FAILED" not in await events_of(services, awaiting.incident_id)
     assert isinstance(await services.dedup.acquire("svc-c", CODE, uuid4()), Duplicate)
     assert graph.calls == []
 
 
-def test_lifespan_reconciles_on_startup_and_stops_reaper() -> None:
+async def test_reconcile_leaves_fresh_inflight_untouched() -> None:
+    services, clock, _ = make_services()
+    triaging = await add_incident(services, "TRIAGING", token="AA", service="svc-a")
+    executing = await add_incident(services, "EXECUTING", token="BB", service="svc-b")
+    clock.advance(STALE - 1)
+    assert await services.lifecycle.reconcile_orphans() == 0
+    assert await state_of(services, triaging.incident_id) == "TRIAGING"
+    assert await state_of(services, executing.incident_id) == "EXECUTING"
+    assert isinstance(await services.dedup.acquire("svc-a", CODE, uuid4()), Duplicate)
+    assert isinstance(await services.dedup.acquire("svc-b", CODE, uuid4()), Duplicate)
+
+
+async def test_startup_reconcile_skipped_when_lock_held_by_another_worker() -> None:
+    services, clock, _ = make_services()
+    incident = await add_incident(services, "TRIAGING")
+    clock.advance(STALE + 1)
+    lock = InMemoryReconcileLock()
+    assert await lock.acquire("other-worker")
+    assert await services.lifecycle.startup_reconcile(lock, "me") is None
+    assert await state_of(services, incident.incident_id) == "TRIAGING"
+    assert not await lock.acquire("me")  # still held by the other worker, not stolen or released
+
+
+async def test_startup_reconcile_releases_lock_after_run() -> None:
+    services, clock, _ = make_services()
+    incident = await add_incident(services, "EXECUTING")
+    clock.advance(STALE + 1)
+    lock = InMemoryReconcileLock()
+    assert await services.lifecycle.startup_reconcile(lock, "me") == 1
+    assert await state_of(services, incident.incident_id) == "FAILED"
+    assert await lock.acquire("someone-else")  # free again
+
+
+async def test_startup_reconcile_without_lock_runs() -> None:
+    services, clock, _ = make_services()
+    incident = await add_incident(services, "TRIAGING")
+    clock.advance(STALE + 1)
+    assert await services.lifecycle.startup_reconcile(None) == 1
+    assert await state_of(services, incident.incident_id) == "FAILED"
+
+
+async def test_startup_reconcile_releases_lock_when_run_fails() -> None:
     services, _, _ = make_services()
+    repo = services.incidents
+    assert isinstance(repo, InMemoryIncidentRepository)
+
+    async def boom(stale_seconds: int) -> list[Any]:
+        raise RuntimeError("db down")
+
+    repo.reconcile_stale_inflight = boom  # type: ignore[method-assign]
+    lock = InMemoryReconcileLock()
+    with pytest.raises(RuntimeError):
+        await services.lifecycle.startup_reconcile(lock, "me")
+    assert await lock.acquire("other")
+
+
+async def test_reconcile_isolates_per_incident_failures() -> None:
+    services, clock, _ = make_services()
+    first = await add_incident(services, "TRIAGING", token="AA", service="svc-a")
+    second = await add_incident(services, "TRIAGING", token="BB", service="svc-b")
+    clock.advance(STALE + 1)
+    real_append = services.audit.append_event
+
+    async def flaky_append(incident_id: UUID, event_type: str, payload: dict[str, Any]) -> Any:
+        if incident_id == first.incident_id:
+            raise RuntimeError("audit down")
+        return await real_append(incident_id, event_type, payload)
+
+    audit = services.audit
+    audit.append_event = flaky_append  # type: ignore[method-assign]
+    assert await services.lifecycle.reconcile_orphans() == 2
+    assert await state_of(services, first.incident_id) == "FAILED"
+    assert await state_of(services, second.incident_id) == "FAILED"
+    # audit failure on the first must not skip its lock release or the second incident
+    assert isinstance(await services.dedup.acquire("svc-a", CODE, uuid4()), Acquired)
+    assert isinstance(await services.dedup.acquire("svc-b", CODE, uuid4()), Acquired)
+    assert "INCIDENT_FAILED" in await events_of(services, second.incident_id)
+
+
+def test_lifespan_reconciles_on_startup_and_stops_reaper() -> None:
+    services, clock, _ = make_services()
     app = create_app(services, Settings(use_in_memory=True, dry_run=True, reaper_interval_seconds=0.05))
 
     async def seed() -> UUID:
         return (await add_incident(services, "EXECUTING")).incident_id
 
     incident_id = asyncio.run(seed())
+    clock.advance(STALE + 1)
     with TestClient(app):
         assert asyncio.run(state_of(services, incident_id)) == "FAILED"
+
+
+async def test_expired_reply_audit_has_no_token_and_sends_single_sms() -> None:
+    services, clock, graph = make_services()
+    incident = await add_incident(services, "AWAITING_APPROVAL")
+    clock.advance(TTL)  # boundary: updated_at <= now - ttl
+    await reply(services, "7A-1")
+    records = await services.audit.records(incident.incident_id)
+    expired = [r for r in records if r.event_type == "INCIDENT_EXPIRED"]
+    assert len(expired) == 1
+    assert "7A" not in str(expired[0].payload) and "token" not in expired[0].payload
+    assert outbox(services) == ["INC-7A no longer active. No action taken."]
+    assert graph.calls == []
+
+
+async def test_concurrent_replies_after_expiry_expire_once() -> None:
+    services, clock, graph = make_services()
+    incident = await add_incident(services, "AWAITING_APPROVAL")
+    clock.advance(TTL + 5)
+    await asyncio.gather(reply(services, "7A-1"), reply(services, "7A-2"), reply(services, "7A-1"))
+    assert await state_of(services, incident.incident_id) == "EXPIRED"
+    assert (await events_of(services, incident.incident_id)).count("INCIDENT_EXPIRED") == 1
+    assert graph.calls == []
+    assert await fingerprint_free(services)
+
+
+def test_demo_reply_route_expires_through_same_path() -> None:
+    services, clock, graph = make_services()
+    app = create_app(services, Settings(use_in_memory=True, dry_run=True))
+    incident = asyncio.run(add_incident(services, "AWAITING_APPROVAL"))
+    clock.advance(TTL + 1)
+    client = TestClient(app)  # no lifespan: the reaper does not run
+    assert client.post("/api/demo/reply", json={"token": "7A", "choice": 1}).status_code == 202
+    assert asyncio.run(state_of(services, incident.incident_id)) == "EXPIRED"
+    assert asyncio.run(events_of(services, incident.incident_id))[-1] == "INCIDENT_EXPIRED"
+    assert graph.calls == []
+    assert asyncio.run(fingerprint_free(services))
+    assert outbox(services) == ["INC-7A no longer active. No action taken."]
+
+
+async def test_reaper_and_reply_share_side_effects_exactly_once() -> None:
+    services, clock, graph = make_services()
+    incident = await add_incident(services, "AWAITING_APPROVAL")
+    clock.advance(TTL + 1)
+    assert await services.lifecycle.reap_once() == 1
+    await reply(services, "7A-1")  # already expired: informational only
+    assert await services.lifecycle.reap_once() == 0
+    assert (await events_of(services, incident.incident_id)).count("INCIDENT_EXPIRED") == 1
+    assert outbox(services)[0] == "INC-7A no longer active. No action taken."
+    assert graph.calls == []
+    assert await fingerprint_free(services)
+
+
+def test_lifespan_boot_fails_only_stale_inflight_and_frees_their_fingerprints() -> None:
+    """Task 15.2(a): through create_app's lifespan with INFLIGHT_STALE_SECONDS=10."""
+    services, clock, _ = make_services()
+    services = replace(services, inflight_stale_seconds=10)
+    app = create_app(services, Settings(use_in_memory=True, dry_run=True, reaper_interval_seconds=60.0))
+
+    async def seed() -> dict[str, UUID]:
+        ids: dict[str, UUID] = {}
+        ids["stale_triaging"] = (await add_incident(services, "TRIAGING", token="T1", service="svc-a")).incident_id
+        ids["stale_executing"] = (await add_incident(services, "EXECUTING", token="T2", service="svc-b")).incident_id
+        clock.advance(6)
+        ids["fresh_triaging"] = (await add_incident(services, "TRIAGING", token="T3", service="svc-c")).incident_id
+        ids["fresh_executing"] = (await add_incident(services, "EXECUTING", token="T4", service="svc-d")).incident_id
+        clock.advance(5)  # stale rows are 11s old (>= 10), fresh rows 5s old
+        return ids
+
+    ids = asyncio.run(seed())
+    alert = {"service_name": "svc-a", "error_code": CODE, "summary": "again"}
+    with TestClient(app) as client:
+        for key in ("stale_triaging", "stale_executing"):
+            assert asyncio.run(state_of(services, ids[key])) == "FAILED"
+            records = asyncio.run(services.audit.records(ids[key]))
+            assert records[-1].event_type == "INCIDENT_FAILED"
+            assert records[-1].payload == {"reason": "stale_inflight_reconciled"}
+        assert asyncio.run(state_of(services, ids["fresh_triaging"])) == "TRIAGING"
+        assert asyncio.run(state_of(services, ids["fresh_executing"])) == "EXECUTING"
+        for key in ("fresh_triaging", "fresh_executing"):
+            assert "INCIDENT_FAILED" not in asyncio.run(events_of(services, ids[key]))
+
+        # Fresh fingerprints stay locked; stale ones are free for a brand-new incident.
+        dup = client.post("/webhooks/alerts", json={**alert, "service_name": "svc-c"})
+        assert dup.status_code == 200 and dup.json()["status"] == "DEDUPLICATED"
+        assert dup.json()["incident_id"] == str(ids["fresh_triaging"])
+        for svc, old in (("svc-a", ids["stale_triaging"]), ("svc-b", ids["stale_executing"])):
+            fresh = client.post("/webhooks/alerts", json={**alert, "service_name": svc})
+            assert fresh.status_code == 202
+            assert fresh.json()["incident_id"] != str(old)
+            assert asyncio.run(state_of(services, old)) == "FAILED"
