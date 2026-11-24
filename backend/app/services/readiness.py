@@ -21,6 +21,7 @@ import asyncpg  # type: ignore[import-untyped]
 import redis.exceptions as redis_exceptions
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.app.config import DEFAULT_PAGE_FAILURE_READY_THRESHOLD as DEFAULT_PAGE_FAILURE_READY_THRESHOLD  # re-export
 from backend.app.services.health_state import HealthState
 
 logger = logging.getLogger("pagemaster.readiness")
@@ -28,7 +29,6 @@ logger = logging.getLogger("pagemaster.readiness")
 DEPENDENCY_UNAVAILABLE_DETAIL: Final[str] = "dependency unavailable"
 RETRY_AFTER_SECONDS: Final[int] = 5
 READY_CHECK_TIMEOUT_SECONDS: Final[float] = 2.0
-DEFAULT_PAGE_FAILURE_READY_THRESHOLD: Final[int] = 3
 #: The reaper is considered dead after this many missed intervals.
 REAPER_DEAD_AFTER_INTERVALS: Final[float] = 3.0
 

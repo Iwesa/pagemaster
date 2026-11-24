@@ -1034,6 +1034,114 @@
         "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
         "timestamp": 1795528515798
       }
+    ],
+    "28.1 Create `backend/app/services/gsm7.py` (GSM 03.38 septet counting, transliteration, UCS-2 prevention, septet clamping), `sanitizer.py` (PII/secret redaction, reply-code neutralisation, `format_pager_payload`), `tripwire.py` (`TripwireValidator`, `TripwireViolationError`, `parse_sms_reply`) and `audit_chain.py` (`AuditLogger`, `jsonb_text`, hash chain verification).": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541552608
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541579590
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795542279368
+      }
+    ],
+    "28.2 Reduce `guardrails.py` to a backwards-compatible facade re-exporting every public symbol through `__all__`, so existing imports in `backend/app/` and `backend/tests/` keep working unchanged.": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541555989
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795542280855
+      }
+    ],
+    "29.1 Create `webhooks.py`, `incidents.py`, `demo.py` and `health.py` under `backend/app/api/` holding the existing handlers and helpers (demo router gated behind `DRY_RUN=true`).": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541558741
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795542282782
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795543000228
+      }
+    ],
+    "29.2 Make `routes.py` assemble them through a single `build_router(...)` entry point and re-export the shared helpers that tests reference.": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541559260
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795543001829
+      }
+    ],
+    "30.1 Extract `Settings` and environment parsing into `backend/app/config.py`, and `ServiceContainer`, `build_in_memory_services` and `build_real_services` into `backend/app/container.py`; `main.py` keeps only app creation and lifespan (re-export what tests import).": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541559887
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795543004087
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795544009048
+      }
+    ],
+    "30.2 Add `backend/tests/conftest.py` registering Hypothesis profiles `dev` (`max_examples=25`) and `ci` (`max_examples=200`), and pass `--hypothesis-profile=dev` in `.kiro/hooks/pbt-on-save.json`.": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795541563830
+      },
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795544017594
+      }
+    ],
+    "28. Decompose `guardrails.py` into focused domain modules behind a facade": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795542281372
+      }
+    ],
+    "29. Split `backend/app/api/routes.py` into domain-aligned sub-routers": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795543003228
+      }
+    ],
+    "30. Separate configuration and dependency wiring from `main.py` and add Hypothesis profiles": [
+      {
+        "executionId": "1edd055f-707b-420b-8bfb-ae55b9eddb2a",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795544018316
+      }
     ]
   }
 }

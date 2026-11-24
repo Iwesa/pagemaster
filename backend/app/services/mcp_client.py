@@ -42,13 +42,13 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.message import SessionMessage
 
 from backend.app.agents.ports import Runbook, TelemetryContext
+from backend.app.config import DEFAULT_TELEMETRY_MAX_CONCURRENCY
 from backend.app.mcp.server import IncidentContext
 from backend.app.services.telemetry_adapters import to_telemetry_context
 
 logger = logging.getLogger("pagemaster.mcp_client")
 
 MCP_CALL_TIMEOUT_SECONDS: Final[float] = 5.0
-DEFAULT_TELEMETRY_MAX_CONCURRENCY: Final[int] = 4
 ACLOSE_TIMEOUT_SECONDS: Final[float] = 10.0
 _TOOL_NAME: Final[str] = "get_incident_context"
 _DEFAULT_SERVER_ARGS: Final[tuple[str, ...]] = ("-m", "backend.app.mcp.server")

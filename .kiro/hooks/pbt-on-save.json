@@ -8,7 +8,7 @@
       "matcher": "backend/app/(agents|mcp|services)/.*\\.py$",
       "action": {
         "type": "command",
-        "command": "pytest backend/tests/test_properties.py -v --tb=short"
+        "command": "pytest backend/tests/test_properties.py -v --tb=short --hypothesis-profile=dev"
       }
     }
   ]

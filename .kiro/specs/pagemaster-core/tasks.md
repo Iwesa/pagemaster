@@ -181,3 +181,17 @@ Notes for tasks 16 to 27 (apply to every one of them):
   - Add `.github/workflows/ci.yml`: `pip install -r backend/requirements.txt`, `mypy --strict backend/app`, `pytest -q` with Postgres and Redis service containers and both env vars set, plus a job that builds `backend/Dockerfile`, runs `docker compose up -d --wait`, posts an alert, waits for the page in the dry-run outbox, replies through `/api/demo/reply`, expects `RESOLVED`, then `docker compose down -v`.
   - Add a Hypothesis stateful test for the incident lifecycle (alert, reply, duplicate, crash, reaper tick, expiry) asserting requirement 12.2.
   - Acceptance: deleting the reaper or the token cooldown makes at least one test fail. The workflow file is validated locally (YAML parse); it cannot be executed here.
+
+# Refactoring (modularity, cohesion, readability)
+
+Notes for tasks 28 to 30: behaviour-preserving refactor only. No test assertions change, no HTTP route/status code/DB schema/audit hash formula changes, `backend/app/agents/` stays free of FastAPI, httpx, asyncpg and Redis imports. Run `mypy --strict backend/app` and `pytest backend/tests/ -v` after each task and fix regressions before moving on.
+
+- [x] 28. Decompose `guardrails.py` into focused domain modules behind a facade
+  - [x] 28.1 Create `backend/app/services/gsm7.py` (GSM 03.38 septet counting, transliteration, UCS-2 prevention, septet clamping), `sanitizer.py` (PII/secret redaction, reply-code neutralisation, `format_pager_payload`), `tripwire.py` (`TripwireValidator`, `TripwireViolationError`, `parse_sms_reply`) and `audit_chain.py` (`AuditLogger`, `jsonb_text`, hash chain verification).
+  - [x] 28.2 Reduce `guardrails.py` to a backwards-compatible facade re-exporting every public symbol through `__all__`, so existing imports in `backend/app/` and `backend/tests/` keep working unchanged.
+- [x] 29. Split `backend/app/api/routes.py` into domain-aligned sub-routers
+  - [x] 29.1 Create `webhooks.py`, `incidents.py`, `demo.py` and `health.py` under `backend/app/api/` holding the existing handlers and helpers (demo router gated behind `DRY_RUN=true`).
+  - [x] 29.2 Make `routes.py` assemble them through a single `build_router(...)` entry point and re-export the shared helpers that tests reference.
+- [x] 30. Separate configuration and dependency wiring from `main.py` and add Hypothesis profiles
+  - [x] 30.1 Extract `Settings` and environment parsing into `backend/app/config.py`, and `ServiceContainer`, `build_in_memory_services` and `build_real_services` into `backend/app/container.py`; `main.py` keeps only app creation and lifespan (re-export what tests import).
+  - [x] 30.2 Add `backend/tests/conftest.py` registering Hypothesis profiles `dev` (`max_examples=25`) and `ci` (`max_examples=200`), and pass `--hypothesis-profile=dev` in `.kiro/hooks/pbt-on-save.json`.
