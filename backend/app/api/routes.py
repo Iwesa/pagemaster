@@ -23,22 +23,38 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.exceptions import RequestValidationError
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
+from backend.app.agents.graph import REASON_PAGER_UNDELIVERABLE
 from backend.app.agents.ports import SmsPort
 from backend.app.services.africastalking_client import (
     AfricasTalkingSmsAdapter,
     canonicalize_e164,
     extract_webhook_secret,
 )
-from backend.app.services.sms_common import OutboxMessage
+from backend.app.services.health_state import HealthState
+from backend.app.services.readiness import (
+    DEFAULT_PAGE_FAILURE_READY_THRESHOLD,
+    CheckResult,
+    dependency_kind,
+    OutageLog,
+    PagerCheck,
+    ReaperHeartbeat,
+    ReadinessChecks,
+    ReadinessReport,
+    run_readiness,
+)
+from backend.app.services.hint_limiter import HintLimiter, HintRateLimiter
+from backend.app.services.sms_common import GENERIC_HINT_TEXT, OutboxMessage, mask_phone
 from backend.app.services.leader_lock import ReconcileLock
+from backend.app.services.page_rate import CoalescingPageGate
 from backend.app.services.seen_ids import InMemorySeenIdStore, SeenIdStore
 from backend.app.services.dedup import DedupStore, Duplicate, release_on_terminal
 from backend.app.services.lifecycle import DEFAULT_APPROVAL_TTL_SECONDS, Lifecycle, utc_now
 from backend.app.services.guardrails import (
     AuditEvent,
     AuditRecord,
+    MAX_PAGE_OPTIONS,
     ResolutionGates,
     can_resolve,
     parse_sms_reply,
@@ -46,22 +62,36 @@ from backend.app.services.guardrails import (
 )
 from backend.app.services.incident_store import (
     ALL_STATUSES,
+    DEFAULT_TOKEN_COOLDOWN_SECONDS,
     SYSTEM_INCIDENT_ID,
+    TOKEN_ALPHABET,
     ActiveFingerprintError,
     AuditStore,
     IncidentRecord,
     IncidentRepository,
     IncidentStatus,
     TokenCollisionError,
+    TokenExhaustedError,
     generate_token,
 )
 
 logger = logging.getLogger("pagemaster.api")
 
 EVENT_ALERT_DEDUPLICATED: Final[str] = "ALERT_DEDUPLICATED"
+EVENT_ALERT_DEDUPLICATED_SUMMARY: Final[str] = "ALERT_DEDUPLICATED_SUMMARY"
+#: After the sampled rows, one summary row per this many further duplicates.
+DEDUP_SUMMARY_EVERY: Final[int] = 100
+DEFAULT_MAX_ALERT_BODY_BYTES: Final[int] = 65_536
+DEFAULT_DEDUP_AUDIT_SAMPLE: Final[int] = 20
 EVENT_WORKFLOW_ERROR: Final[str] = "WORKFLOW_ERROR"
 EVENT_INCIDENT_FAILED: Final[str] = "INCIDENT_FAILED"
-MAX_TOKEN_ATTEMPTS: Final[int] = 20
+EVENT_INCIDENT_NO_ACTION: Final[str] = "INCIDENT_NO_ACTION"
+REASON_NO_APPROVED_RUNBOOK: Final[str] = "no_approved_runbook"
+#: Insert attempts after a lost token race (the unique index decides); exhaustion is exact, not retried.
+MAX_TOKEN_ATTEMPTS: Final[int] = 5
+EVENT_TOKEN_EXHAUSTED: Final[str] = "TOKEN_EXHAUSTED"
+REASON_NO_FREE_TOKEN: Final[str] = "no_free_token"
+TOKEN_RETRY_AFTER_SECONDS: Final[int] = 30
 MAX_SMS_BODY_BYTES: Final[int] = 16_384
 MAX_MESSAGE_ID_CHARS: Final[int] = 128
 
@@ -96,20 +126,50 @@ class AppServices:
     africastalking_shortcode: str = ""
     seen_ids: SeenIdStore = field(default_factory=InMemorySeenIdStore)
     alert_webhook_secret: str = ""
+    #: Bearer key for the read APIs when not in dry run (``API_READ_SECRET``). Empty = reject (fail closed).
+    api_read_secret: SecretStr = SecretStr("")
     #: Legacy opt-in: also accept the webhook secret as ``?secret=`` (default header-only).
     allow_query_secret: bool = False
     #: Refreshes demo telemetry rows (returns rows touched). ``None`` = nothing to refresh.
     reseed: Callable[[], Awaitable[int]] | None = None
-    #: Cheap dependency probe for ``/healthz``; raises on failure. ``None`` = always ready.
-    ping: Callable[[], Awaitable[None]] | None = None
+    #: Cheap dependency probes for ``/readyz``; raise on failure. ``None`` = in-memory mode (always ok).
+    ping_postgres: Callable[[], Awaitable[None]] | None = None
+    ping_redis: Callable[[], Awaitable[None]] | None = None
+    #: ``/readyz`` pager check fails at this many consecutive page failures (``PAGE_FAILURE_READY_THRESHOLD``).
+    page_failure_ready_threshold: int = DEFAULT_PAGE_FAILURE_READY_THRESHOLD
+    #: Reaper liveness for ``/readyz`` (touched by ``Lifecycle.run_reaper``).
+    reaper: ReaperHeartbeat = field(default_factory=ReaperHeartbeat)
+    #: Once-per-outage logging state for the 503 handlers.
+    outages: OutageLog = field(default_factory=OutageLog)
     #: Seconds an incident may wait in ``AWAITING_APPROVAL`` before it expires.
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS
     #: Age (seconds) after which TRIAGING/EXECUTING incidents count as orphaned (Req 6.4).
     inflight_stale_seconds: int = 60
+    #: Max seconds in TRIAGING / EXECUTING before the reaper recovers or fails the incident (Req 6.8).
+    triage_timeout_seconds: int = 120
+    executing_timeout_seconds: int = 120
+    #: A token stays unavailable this long after its incident became terminal (Req 9.1).
+    token_cooldown_seconds: int = DEFAULT_TOKEN_COOLDOWN_SECONDS
+    #: Characters a 2-character token is drawn from (injectable so tests can exhaust it).
+    token_alphabet: str = TOKEN_ALPHABET
+    #: Largest accepted ``POST /webhooks/alerts`` body in bytes (Req 10.4).
+    max_alert_body_bytes: int = DEFAULT_MAX_ALERT_BODY_BYTES
+    #: ``ALERT_DEDUPLICATED`` rows written per incident before only summaries (Req 10.5).
+    dedup_audit_sample: int = DEFAULT_DEDUP_AUDIT_SAMPLE
     #: Optional leader lock for startup reconciliation (``None`` = single process, no lock).
     reconcile_lock: ReconcileLock | None = None
     #: Time source for expiry checks (injectable for tests).
     clock: Callable[[], datetime] = utc_now
+    #: Consecutive page-delivery failures (Req 8.4); exposed by /readyz in a later task.
+    health: HealthState = field(default_factory=HealthState)
+    #: One unparseable-reply hint per sender per 60 s (Req 4.10).
+    hint_limiter: HintLimiter = field(default_factory=HintRateLimiter)
+    #: Rate gate for individual pages; the reaper tick flushes its summary page (Req 10.3).
+    page_gate: CoalescingPageGate | None = None
+    #: Max seconds a reply waits for a TRIAGING incident to reach approval (Req 6.12).
+    triage_wait_seconds: float = 2.0
+    #: Sleep used while waiting (injectable for tests).
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     @property
     def lifecycle(self) -> Lifecycle:
@@ -121,7 +181,15 @@ class AppServices:
             approval_ttl_seconds=self.approval_ttl_seconds,
             clock=self.clock,
             inflight_stale_seconds=self.inflight_stale_seconds,
+            triage_timeout_seconds=self.triage_timeout_seconds,
+            executing_timeout_seconds=self.executing_timeout_seconds,
+            resume_triage=self._resume,
+            flush_pages=self.page_gate.flush if self.page_gate is not None else None,
+            heartbeat=self.reaper,
         )
+
+    async def _resume(self, incident_id: UUID) -> bool:
+        return await _resume_triage(self, incident_id)
 
 
 def get_services(request: Request) -> AppServices:
@@ -186,23 +254,73 @@ async def _run_workflow(services: AppServices, incident: IncidentRecord, graph_i
     """Run or resume the graph, then sync incident state and dedup lock. Never raises."""
     try:
         result = await services.graph.ainvoke(graph_input, _thread_config(incident.incident_id))
-        status = result.get("status") if isinstance(result, dict) else None
-        if not (isinstance(status, str) and status in ALL_STATUSES):
-            return
-        gates = _gates_from_result(result)
-        new_status = cast(IncidentStatus, status)
-        # The graph ends in EXECUTING only when the executor ran but a gate is false.
-        # RESOLVED is never written unless all four gates are true (Req 5.4, 5.5, 5.6).
-        if new_status == "EXECUTING" or (new_status == "RESOLVED" and not can_resolve(gates)):
-            await _fail_incident(services, incident, "remediation_incomplete", gates)
-            return
-        await services.incidents.record_resolution(incident.incident_id, new_status, gates)
-        await release_on_terminal(
-            services.dedup, new_status, incident.service_name, incident.error_code, incident.incident_id
-        )
+        await _apply_result(services, incident, result)
     except Exception:
         logger.exception("workflow failed for incident %s", incident.incident_id)
         await _fail_incident(services, incident, "workflow_exception", None)
+
+
+async def _apply_result(services: AppServices, incident: IncidentRecord, result: Any) -> None:
+    """Sync the incident row and dedup lock with a graph result."""
+    status = result.get("status") if isinstance(result, dict) else None
+    if not (isinstance(status, str) and status in ALL_STATUSES):
+        return
+    gates = _gates_from_result(result)
+    new_status = cast(IncidentStatus, status)
+    coalesced = isinstance(result, dict) and result.get("pager_coalesced") is True
+    if new_status == "AWAITING_APPROVAL" and not coalesced:  # the page went out (Req 8.4)
+        services.health.record_page_success()  # a withheld page (Req 10.3) proves nothing
+    elif new_status == "FAILED":
+        reason = result.get("failure_reason") if isinstance(result, dict) else None
+        if reason == REASON_PAGER_UNDELIVERABLE:
+            services.health.record_page_failure()
+        await _fail_incident(
+            services, incident, reason if isinstance(reason, str) else "workflow_failed", gates
+        )
+        return
+    # The graph ends in EXECUTING only when the executor ran but a gate is false.
+    # RESOLVED is never written unless all four gates are true (Req 5.4, 5.5, 5.6).
+    if new_status == "EXECUTING" or (new_status == "RESOLVED" and not can_resolve(gates)):
+        await _fail_incident(services, incident, "remediation_incomplete", gates)
+        return
+    option_count: int | None = None
+    if new_status in ("AWAITING_APPROVAL", "NO_ACTION"):
+        raw_count = result.get("option_count") if isinstance(result, dict) else None
+        option_count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) else None
+        if new_status == "NO_ACTION":
+            option_count = 0
+    if new_status == "NO_ACTION":  # Req 3.5: audit before the state is terminal; no secrets in payload
+        try:
+            await services.audit.append_event(
+                incident.incident_id, EVENT_INCIDENT_NO_ACTION, {"reason": REASON_NO_APPROVED_RUNBOOK}
+            )
+        except Exception:
+            logger.exception("could not audit NO_ACTION for %s", incident.incident_id)
+    await services.incidents.record_resolution(incident.incident_id, new_status, gates, option_count)
+    await release_on_terminal(
+        services.dedup, new_status, incident.service_name, incident.error_code, incident.incident_id
+    )
+
+
+async def _resume_triage(services: AppServices, incident_id: UUID) -> bool:
+    """Resume a stale TRIAGING incident from its checkpoint (Req 6.8).
+
+    False when there is nothing to resume (no checkpoint, finished graph, row no longer
+    TRIAGING). Exceptions from the graph propagate so the caller can fail the incident.
+    """
+    incident = await services.incidents.get(incident_id)
+    if incident is None or incident.state != "TRIAGING":
+        return False
+    config = _thread_config(incident_id)
+    get_state = getattr(services.graph, "aget_state", None)
+    if get_state is None:
+        return False
+    snapshot = await get_state(config)
+    if not getattr(snapshot, "values", None) or not getattr(snapshot, "next", ()):
+        return False
+    result = await services.graph.ainvoke(None, config)
+    await _apply_result(services, incident, result)
+    return True
 
 
 def _gates_from_result(result: object) -> ResolutionGates:
@@ -242,29 +360,44 @@ async def _fail_incident(
 # GET /healthz (unauthenticated, registered regardless of DRY_RUN)
 # ---------------------------------------------------------------------------
 
-HEALTH_PING_TIMEOUT_SECONDS: Final[float] = 2.0
-
-
 class HealthStatus(BaseModel):
     status: Literal["ok", "unavailable"]
 
 
 @router.get("/healthz", response_model=HealthStatus)
-async def healthz(request: Request, response: Response) -> HealthStatus:
-    """Readiness-lite probe. Never leaks error details; any probe failure is a bare 503."""
-    services: AppServices | None = getattr(request.app.state, "services", None)
-    if services is None:  # lifespan has not finished wiring adapters yet
-        response.status_code = 503
-        return HealthStatus(status="unavailable")
-    if services.ping is not None:
-        try:
-            await asyncio.wait_for(services.ping(), timeout=HEALTH_PING_TIMEOUT_SECONDS)
-        except Exception:
-            logger.warning("health probe failed")
-            response.status_code = 503
-            return HealthStatus(status="unavailable")
+async def healthz() -> HealthStatus:
+    """Liveness only (Req 7.1): 200 while the process serves requests. Checks no dependency."""
     return HealthStatus(status="ok")
 
+
+@router.get("/readyz", response_model=ReadinessReport, response_model_exclude_none=True)
+async def readyz(request: Request, response: Response) -> ReadinessReport:
+    """Readiness (Req 7.5): per-check JSON, 503 when any check fails. Never carries error text."""
+    services: AppServices | None = getattr(request.app.state, "services", None)
+    dry_run = bool(getattr(request.app.state, "dry_run", False))
+    if services is None:  # lifespan has not finished wiring adapters yet
+        response.status_code = 503
+        down = CheckResult(ok=False)
+        return ReadinessReport(
+            status="unavailable",
+            dry_run=dry_run,
+            checks=ReadinessChecks(
+                postgres=down, redis=down, reaper=down, pager=PagerCheck(ok=False, consecutive_failures=0)
+            ),
+        )
+    report = await run_readiness(
+        ping_postgres=services.ping_postgres,
+        ping_redis=services.ping_redis,
+        heartbeat=services.reaper,
+        health=services.health,
+        page_failure_threshold=services.page_failure_ready_threshold,
+        dry_run=dry_run,
+    )
+    if report.checks.postgres.ok and report.checks.redis.ok:
+        services.outages.recovered()
+    if report.status != "ok":
+        response.status_code = 503
+    return report
 
 # ---------------------------------------------------------------------------
 # POST /webhooks/alerts
@@ -272,9 +405,44 @@ async def healthz(request: Request, response: Response) -> HealthStatus:
 
 
 async def _record_duplicate(services: AppServices, holder: UUID, payload: AlertPayload) -> None:
-    occurrence = payload.model_dump(mode="json", exclude_none=True)
-    if await services.audit.append_event(holder, EVENT_ALERT_DEDUPLICATED, occurrence) is None:
+    """Count the duplicate, then audit a bounded sample plus periodic summaries (Req 10.5).
+
+    The first ``dedup_audit_sample`` duplicates per incident get one ``ALERT_DEDUPLICATED`` row each;
+    after that one ``ALERT_DEDUPLICATED_SUMMARY`` row is appended per ``DEDUP_SUMMARY_EVERY`` more.
+    """
+    count = await services.incidents.increment_duplicate_count(holder)
+    if count is None:
         logger.warning("dedup holder %s has no incident record", holder)
+        return
+    sample = max(1, services.dedup_audit_sample)
+    if count <= sample:
+        occurrence = payload.model_dump(mode="json", exclude_none=True)
+        await services.audit.append_event(holder, EVENT_ALERT_DEDUPLICATED, occurrence)
+    elif (count - sample) % DEDUP_SUMMARY_EVERY == 0:
+        await services.audit.append_event(holder, EVENT_ALERT_DEDUPLICATED_SUMMARY, {"duplicates": count})
+
+
+async def _read_alert_body(request: Request, limit: int) -> bytes:
+    """Read the alert body, never buffering more than ``limit`` bytes (Req 10.4).
+
+    A declared ``Content-Length`` over the limit is rejected before any read. The stream is
+    limited as well, because the header can be absent or wrong.
+    """
+    declared = request.headers.get("Content-Length")
+    if declared is not None:
+        text = declared.strip()
+        if not (text.isascii() and text.isdigit()):
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+        if int(text) > limit:
+            raise HTTPException(status_code=413, detail="payload too large")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="payload too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _bearer_valid(secret: str, header: str) -> bool:
@@ -314,7 +482,7 @@ async def receive_alert(
     # Authenticate before the body is read, parsed or validated.
     await _authorize_alert(request, services)
     try:
-        payload = AlertPayload.model_validate_json(await request.body())
+        payload = AlertPayload.model_validate_json(await _read_alert_body(request, services.max_alert_body_bytes))
     except ValidationError as exc:
         raise RequestValidationError(exc.errors(include_url=False, include_context=False, include_input=False)) from exc
     incident_id = uuid4()
@@ -325,15 +493,24 @@ async def receive_alert(
         return AlertDeduplicated(incident_id=acquired.incident_id)
 
     async def release() -> None:
-        await services.dedup.release(payload.service_name, payload.error_code, incident_id)
+        """Best effort: a failing release (outage) must not mask the original error; the TTL frees it."""
+        try:
+            await services.dedup.release(payload.service_name, payload.error_code, incident_id)
+        except Exception:
+            logger.warning("could not release dedup lock for %s", incident_id)
 
     incident: IncidentRecord | None = None
     try:
         for _ in range(MAX_TOKEN_ATTEMPTS):
+            busy = await services.incidents.busy_tokens(services.token_cooldown_seconds)
+            try:
+                token = generate_token(busy, services.token_alphabet)
+            except TokenExhaustedError:
+                break
             try:
                 incident = await services.incidents.create(
                     incident_id=incident_id,
-                    token=generate_token(),
+                    token=token,
                     service_name=payload.service_name,
                     error_code=payload.error_code,
                     raw_alert=payload.model_dump(mode="json", exclude_none=True),
@@ -349,7 +526,14 @@ async def receive_alert(
                 return AlertDeduplicated(incident_id=exc.incident_id)
         if incident is None:
             await release()
-            raise HTTPException(status_code=503, detail="no free incident token")
+            await services.audit.append_event(
+                SYSTEM_INCIDENT_ID, EVENT_TOKEN_EXHAUSTED, {"reason": REASON_NO_FREE_TOKEN}
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="no free incident token",
+                headers={"Retry-After": str(TOKEN_RETRY_AFTER_SECONDS)},
+            )
         await services.audit.append_event(
             incident.incident_id,
             AuditEvent.INCIDENT_CREATED,
@@ -359,6 +543,10 @@ async def receive_alert(
     except HTTPException:
         raise
     except BaseException:
+        if incident is not None:
+            # The row exists but the request failed before the workflow started: do not leave a
+            # TRIAGING incident behind (it would shadow re-fired alerts until the reaper runs).
+            await _fail_incident(services, incident, "alert_setup_failed", None)
         await release()
         raise
 
@@ -384,8 +572,7 @@ def _digits(raw: str) -> str:
 
 
 def _mask_sender(raw: str) -> str:
-    digits = _digits(raw)
-    return f"***{digits[-4:]}" if len(digits) > 4 else "***"
+    return mask_phone(raw, prefix=0, tail=4)
 
 
 def secret_violation(expected_secret: str, supplied_secrets: Iterable[str]) -> str | None:
@@ -501,18 +688,73 @@ async def africastalking_sms(request: Request, background: BackgroundTasks, serv
     if not await services.seen_ids.claim(message_id):
         return SmsAck()
 
-    await _handle_reply(services, background, form.get("text", ""))
+    try:
+        await _handle_reply(services, background, form.get("text", ""), sender=canonicalize_e164(sender) or sender)
+    except Exception as exc:
+        if dependency_kind(exc) is not None:  # 503 follows: let the provider's redelivery be processed
+            try:
+                await services.seen_ids.forget(message_id)
+            except Exception:
+                logger.warning("could not release message id claim")
+        raise
     return SmsAck(status="ok")
 
 
-async def _handle_reply(services: AppServices, background: BackgroundTasks, body: str) -> None:
+TRIAGE_POLL_SECONDS: Final[float] = 0.1
+#: Terminal states reachable through an approval reply; a reply arriving this soon after one
+#: is the loser of a race (Req 4.11), later ones get the plain "no longer active" answer.
+ALREADY_HANDLED_WINDOW_SECONDS: Final[float] = 30.0
+_REPLY_TERMINAL_STATES: Final[frozenset[str]] = frozenset({"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED"})
+
+
+async def _wait_for_triage(services: AppServices, incident: IncidentRecord) -> IncidentRecord:
+    """Req 6.12: give a ``TRIAGING`` incident up to ``triage_wait_seconds`` to reach approval.
+
+    Polls the repository every ``TRIAGE_POLL_SECONDS``; returns the latest row (possibly still
+    ``TRIAGING``). The waiting budget is the sum of the requested sleeps, so tests can inject
+    ``services.sleep`` and run instantly.
+    """
+    waited = 0.0
+    current = incident
+    while current.state == "TRIAGING" and waited < services.triage_wait_seconds:
+        step = min(TRIAGE_POLL_SECONDS, services.triage_wait_seconds - waited)
+        await services.sleep(step)
+        waited += step
+        refreshed = await services.incidents.get(incident.incident_id)
+        if refreshed is None:
+            break
+        current = refreshed
+    return current
+
+
+async def _send_hint(services: AppServices, sender: str) -> None:
+    """Req 4.10: tell the authorized sender what to reply, at most once per window."""
+    if not await services.hint_limiter.allow(sender):
+        return
+    awaiting = await services.incidents.list_by_states(["AWAITING_APPROVAL"], limit=2)
+    if len(awaiting) == 1:
+        only = awaiting[0]
+        count = only.option_count if only.option_count is not None else MAX_PAGE_OPTIONS
+        if count >= 1:
+            codes = " or ".join(f"{only.token}-{n}" for n in range(1, min(count, MAX_PAGE_OPTIONS) + 1))
+            await _notify(services, f"INC-{only.token} Reply {codes}")
+            return
+    await _notify(services, GENERIC_HINT_TEXT)
+
+
+async def _handle_reply(
+    services: AppServices, background: BackgroundTasks, body: str, sender: str | None = None
+) -> None:
     """Parse an SMS reply body and resume the workflow. Shared by the webhook and demo route.
 
-    Callers are responsible for authenticating the request first.
+    Callers are responsible for authenticating the request first. ``sender`` is the
+    already-authorized sender; only then is a hint sent for unparseable text.
     """
     reply = parse_sms_reply(body)
     if reply is None:
-        return  # not an action code: ignore, no mutation
+        if sender is not None:  # Req 4.10: authorized sender only
+            await _send_hint(services, sender)
+        return  # not an action code: no mutation
 
     # Req 6.1, 6.2, 6.7: the store clock decides expiry, before any graph resume.
     outcome = await services.incidents.expire_if_stale(reply.token, services.approval_ttl_seconds)
@@ -523,25 +765,71 @@ async def _handle_reply(services: AppServices, background: BackgroundTasks, body
         await services.incidents.get_active_by_token(reply.token) if outcome.found else None
     )
     if incident is None:  # Req 4.5: unknown, expired or resolved
+        latest = await services.incidents.latest_by_token(reply.token)
+        if latest is not None and latest.state == "EXPIRED":  # Req 6.10: answer only, mutate nothing
+            await _notify(services, f"INC-{reply.token} expired. No action taken.")
+            return
+        if latest is not None and latest.state in _REPLY_TERMINAL_STATES:
+            age = (services.clock() - latest.updated_at).total_seconds()
+            if age <= ALREADY_HANDLED_WINDOW_SECONDS:  # Req 4.11: lost the race to another reply
+                await _notify(services, f"INC-{reply.token} already handled ({latest.state}).")
+                return
         await _notify(services, f"INC-{reply.token} no longer active. No action taken.")
+        return
+    if incident.state == "TRIAGING":  # Req 6.12: do not drop an early reply
+        incident = await _wait_for_triage(services, incident)
+        if incident.state == "TRIAGING":  # Req 4.12: answer only
+            await _notify(services, f"INC-{reply.token} still being triaged, reply again in a moment.")
+            return
+    if incident.state != "AWAITING_APPROVAL":  # EXECUTING or already terminal: another reply won
+        await _notify(services, f"INC-{reply.token} already handled ({incident.state}).")
+        return
+    if incident.option_count is not None and int(reply.choice) > incident.option_count:
+        codes = " or ".join(f"{reply.token}-{n}" for n in range(1, incident.option_count + 1))
+        valid = f"valid reply is {codes}." if codes else "no reply options."
+        await _notify(services, f"INC-{reply.token} {valid}")  # Req 3.6: no such option; no change
         return
     claimed = await services.incidents.compare_and_set_state(
         incident.incident_id, "AWAITING_APPROVAL", "EXECUTING"
     )
-    if not claimed:  # still triaging, or another reply already won
-        await _notify(services, f"INC-{reply.token} is not awaiting approval. No action taken.")
+    if not claimed:  # another reply (or the reaper) won between the read and the claim
+        current = await services.incidents.get(incident.incident_id)
+        state = current.state if current is not None else "UNKNOWN"
+        await _notify(services, f"INC-{reply.token} already handled ({state}).")
         return
 
     # Req 4.4: resume the suspended graph with the selected action.
     background.add_task(_run_workflow, services, incident, Command(resume={"choice": reply.choice}))
-
 
 # ---------------------------------------------------------------------------
 # Read APIs
 # ---------------------------------------------------------------------------
 
 
-@router.get("/api/incidents", response_model=list[IncidentView])
+async def require_read_access(request: Request, services: Services) -> None:
+    """Req 11.2: outside dry run the read APIs need ``Authorization: Bearer <API_READ_SECRET>``.
+
+    Constant-time comparison on bytes; an unset secret rejects everything. A failure is audited on
+    the system incident with a reason only (never the supplied or configured key).
+    """
+    if bool(getattr(request.app.state, "dry_run", False)):
+        return
+    secret = services.api_read_secret.get_secret_value()
+    header = request.headers.get("Authorization", "")
+    if secret and _bearer_valid(secret, header):
+        return
+    reason = "read_key_not_configured" if not secret else ("read_key_missing" if not header else "invalid_read_key")
+    try:
+        await services.audit.append_event(SYSTEM_INCIDENT_ID, AuditEvent.SECURITY_VIOLATION, {"reason": reason})
+    except Exception:
+        logger.exception("could not audit read api rejection")
+    raise HTTPException(status_code=401, detail="unauthorized", headers={"WWW-Authenticate": "Bearer"})
+
+
+ReadAccess = [Depends(require_read_access)]
+
+
+@router.get("/api/incidents", response_model=list[IncidentView], dependencies=ReadAccess)
 async def list_incidents(services: Services) -> list[IncidentView]:
     rows = await services.incidents.list_recent()
     return [
@@ -658,7 +946,7 @@ async def demo_reseed(services: Services) -> DemoReseedResult:
     return DemoReseedResult(rows_refreshed=rows)
 
 
-@router.get("/api/incidents/{incident_id}/audit", response_model=AuditView)
+@router.get("/api/incidents/{incident_id}/audit", response_model=AuditView, dependencies=ReadAccess)
 async def incident_audit(incident_id: UUID, services: Services) -> AuditView:
     if incident_id == SYSTEM_INCIDENT_ID or await services.incidents.get(incident_id) is None:
         raise HTTPException(status_code=404, detail="incident not found")

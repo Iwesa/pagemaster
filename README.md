@@ -40,7 +40,7 @@ backend/app/services/   Guardrails, Redis dedup, Africa's Talking adapter, store
 backend/app/mcp/        FastMCP read-only telemetry server
 backend/app/api/        FastAPI webhook and read/demo routes
 backend/tests/          Pytest integration and Hypothesis property-based test suites
-database/               PostgreSQL schema, read-only views, roles, and seed data
+database/               PostgreSQL scripts: 10_schema.sql, 20_roles.sql, 30_demo_seed.sql, migrations/
 frontend/index.html     1990s Motorola Advisor retro LCD pager simulator
 
 ## Run with Docker
@@ -53,6 +53,10 @@ Open http://localhost:8000. With `DRY_RUN=true` (the default) no SMS is sent. Th
 
 ## Configuration
 
+Copy `.env.example` to `.env` and fill in the values (`.env` is git-ignored).
+
+**Live mode (`DRY_RUN=false`)** refuses to start unless `ALERT_WEBHOOK_SECRET`, `API_READ_SECRET`, `AFRICASTALKING_USERNAME`, `AFRICASTALKING_API_KEY`, `AFRICASTALKING_WEBHOOK_SECRET` and `ONCALL_PHONE_NUMBER` are set. The error lists variable names only. `ONCALL_PHONE_NUMBER` must be E.164 (`+254700123456`); a local format such as `0700123456` is rejected at startup. Live mode registers no demo routes and never loads demo seed data.
+
 | Variable | Purpose | Default |
 |---|---|---|
 | `DRY_RUN` | Use the in-memory SMS outbox instead of Africa's Talking | `true` |
@@ -60,6 +64,7 @@ Open http://localhost:8000. With `DRY_RUN=true` (the default) no SMS is sent. Th
 | `MCP_TRANSPORT` | `stdio` (subprocess MCP server) or `inprocess` | `stdio` |
 | `MCP_READER_DATABASE_URL` | DSN for the `mcp_reader` role | set in compose |
 | `ALERT_WEBHOOK_SECRET` | Bearer token required on `/webhooks/alerts` | empty (off) |
+| `API_READ_SECRET` | Bearer key for `GET /api/incidents` and `/api/incidents/{id}/audit`. Required when `DRY_RUN=false` (401 + `SECURITY_VIOLATION` audit without it); dry run stays open | empty |
 | `GEMINI_API_KEY`, `OPENAI_API_KEY` | Enable the LLM summarizer | empty |
 | `AFRICASTALKING_USERNAME`, `AFRICASTALKING_API_KEY` | Africa's Talking credentials (username `sandbox` selects the sandbox endpoint) | empty |
 | `AFRICASTALKING_SHORTCODE` | Sender shortcode. When set, inbound `to` must match it | empty |
@@ -68,10 +73,47 @@ Open http://localhost:8000. With `DRY_RUN=true` (the default) no SMS is sent. Th
 | `APPROVAL_TTL_SECONDS` | Seconds before a pending approval expires (`EXPIRED`) | `900` |
 | `REAPER_INTERVAL_SECONDS` | Interval of the sweep that expires approvals | `30` |
 | `INFLIGHT_STALE_SECONDS` | Startup reconciliation fails only `TRIAGING`/`EXECUTING` incidents not updated for this long (minimum 10), so a booting worker does not kill another worker's live runs | `60` |
+| `TRIAGE_TIMEOUT_SECONDS` | The reaper resumes a `TRIAGING` incident older than this from its checkpoint, or marks it `FAILED` (`recovered_after_crash`) and texts `INC-<TOKEN> FAILED. Re-send the alert.` (minimum 10) | `120` |
+| `EXECUTING_TIMEOUT_SECONDS` | The reaper marks an `EXECUTING` incident older than this `FAILED` (`execution_timeout`) without re-running remediation (minimum 10) | `120` |
+| `TOKEN_COOLDOWN_SECONDS` | A 2-character incident token is not reissued while an active incident holds it, or until this many seconds after its incident reached a terminal state (store clock). When every token is busy, `POST /webhooks/alerts` returns `503` with `Retry-After: 30`, creates no incident and audits `TOKEN_EXHAUSTED` (minimum 0) | `3600` |
+| `MAX_ALERT_BODY_BYTES` | Largest accepted `POST /webhooks/alerts` body. A larger `Content-Length` gets `413` without reading the body; a body without one is read in chunks and aborted with `413` once it exceeds the limit. The bearer check (`401`) runs first; a malformed `Content-Length` gets `400` (minimum 1) | `65536` |
+| `DEDUP_AUDIT_SAMPLE` | `ALERT_DEDUPLICATED` audit rows kept per incident. Later duplicates are only counted (`incidents.duplicate_count`) and one `ALERT_DEDUPLICATED_SUMMARY` row (`{"duplicates": n}`) is appended per 100 more. The API still answers `200 DEDUPLICATED` (minimum 1) | `20` |
+
+| `TELEMETRY_MAX_CONCURRENCY` | Telemetry lookups in flight at once. One long-lived MCP subprocess and session per worker serves them (respawned when it dies or a call hits a transport error); extra triages wait for a slot, and that wait counts toward the triage timeout, not the 5 s per-call timeout (minimum 1) | `4` |
+| `PAGE_RATE_PER_MINUTE` | Individual pages allowed in any 60 s window. Over the limit, incidents are still created, triaged and left `AWAITING_APPROVAL` (audited `PAGER_COALESCED`), and at most one summary page per minute is sent: `ALERTS: N more (auth-db x5, ...) see dashboard`, with reply codes only when they fit in 160 septets; otherwise those incidents expire through `APPROVAL_TTL_SECONDS`. The limit is per worker (minimum 1) | `6` |
+| `PAGE_FAILURE_READY_THRESHOLD` | Consecutive failed pages at which `/readyz` reports the `pager` check as failing (minimum 1) | `3` |
+| `PAGE_MAX_ATTEMPTS` | Total attempts to send a page. Retryable provider errors (HTTP 5xx, 408, 429, transport errors, timeouts) back off 1 s, 2 s, 4 s with jitter; authentication and invalid-number errors are not retried. If every attempt fails the incident is audited `PAGER_FAILED`, ends `FAILED` (`pager_undeliverable`) and releases its fingerprint (minimum 1) | `3` |
 | `ALLOW_QUERY_SECRET` | Also accept the webhook secret from the `?secret=` query parameter. Less secure: URLs appear in proxy and access logs | `false` |
 | `REDIS_PASSWORD` | Redis `requirepass`; embedded in the backend `REDIS_URL` | `pagemaster_redis_dev` |
-| `POSTGRES_PASSWORD`, `MCP_READER_PASSWORD` | Postgres and `mcp_reader` role passwords (the latter must match `database/init_mock_logs.sql`) | `pagemaster_dev`, `mcp_reader_dev` |
+| `POSTGRES_PASSWORD`, `MCP_READER_PASSWORD` | Postgres and `mcp_reader` role passwords (`20_roles.sql` creates `mcp_reader` with the default `mcp_reader_dev`; the backend syncs `MCP_READER_PASSWORD` at startup) | `pagemaster_dev`, `mcp_reader_dev` |
 
+## Database scripts
+
+The scripts in `database/` are idempotent and contain no database name:
+
+| File | Content |
+|---|---|
+| `10_schema.sql` | Tables, constraints, indexes, audit triggers, read-only views |
+| `20_roles.sql` | `mcp_reader` role and grants (uses `current_database()`) |
+| `30_demo_seed.sql` | Demo logs, runbooks, terminal demo incidents and audit chains. Demo only |
+
+On first boot, compose runs `database/docker-entrypoint/00_init.sh`, which applies 10 and 20 and applies 30 only when `DEMO_SEED=true` (compose sets it from `DRY_RUN`, default `true`). Live mode therefore starts with no demo data. To apply the scripts to any other database:
+
+```
+DATABASE_URL=postgresql://user:pass@host:5432/dbname scripts/apply_schema.sh          # schema and roles
+DATABASE_URL=postgresql://user:pass@host:5432/dbname scripts/apply_schema.sh --demo   # plus demo seed
+```
+
+`PG*` environment variables work when `DATABASE_URL` is unset. The connecting role must be allowed to create roles.
+
+**Existing databases** created from the old `init_mock_logs.sql` lack `incidents.option_count`, `terminal_at`, `duplicate_count` and the `FAILED`/`EXPIRED`/`NO_ACTION` states in the `state` CHECK. Run `psql -v ON_ERROR_STOP=1 -f database/migrations/001_hardening_columns.sql` once (idempotent), then `10_schema.sql` and `20_roles.sql`. Compose only runs init scripts on an empty volume.
+
+## Liveness and readiness
+- `GET /healthz` is liveness only: it answers `200` while the process is up and checks no dependency. Use it to decide whether to restart the container.
+- `GET /readyz` is readiness: `200` when every check passes, otherwise `503`, with a per-check body (never any error text):
+  `{"status": "ok"|"unavailable", "dry_run": bool, "channel": "africastalking", "checks": {"postgres": {"ok": bool}, "redis": {"ok": bool}, "reaper": {"ok": bool}, "pager": {"ok": bool, "consecutive_failures": int}}}`.
+  Postgres (`SELECT 1`) and Redis (`PING`) are probed concurrently with a 2 s limit each, so a hung dependency cannot hang the probe; with `USE_IN_MEMORY=true` they report `"mode": "in_memory"`. `reaper` fails when the background sweep has not ticked for 3 x `REAPER_INTERVAL_SECONDS`. `pager` fails at `PAGE_FAILURE_READY_THRESHOLD` consecutive failed pages. The Docker healthcheck (compose and `backend/Dockerfile`) uses `/readyz`.
+- While Postgres or Redis is unreachable, API requests that need them answer `503 {"detail": "dependency unavailable"}` with `Retry-After: 5` instead of `500`. The outage is logged once, not per request, and the service recovers without a restart.
 ## Africa's Talking SMS
 
 Inbound replies arrive at `POST /webhooks/africastalking/sms` as form fields `from`, `to`, `text`, `date`, `id` and `linkId`. The secret is read from the `X-Webhook-Secret` header, then from `Authorization: Bearer <secret>`, and compared in constant time (`hmac.compare_digest`). Requests without a valid secret are rejected (fail closed). The `?secret=` query parameter is ignored unless `ALLOW_QUERY_SECRET=true`. The alert response never contains the reply token; it only appears in the pager SMS.
@@ -104,7 +146,24 @@ pytest backend/tests/ -v
 mypy --strict backend/app
 ```
 
-The suite runs without Postgres or Redis. The Hypothesis property tests cover the properties in `.kiro/specs/pagemaster-core/design.md`. To run the Postgres integration tests, set `TEST_DATABASE_URL` to a server where the user can create databases.
+The suite runs without Postgres or Redis (the real-stack tests skip). The Hypothesis property tests cover the properties in `.kiro/specs/pagemaster-core/design.md`. `test_lifecycle_state_machine.py` is a stateful Hypothesis test of the incident lifecycle (about 30 s), and `test_chaos_scenarios.py` holds one named scenario per review probe (crash recovery, page failure, double reply, duplicate storm, dependency outage, alert storm) plus meta tests that fail when the reaper sweep or the token cooldown is removed.
+
+### Real-stack tests
+
+The tests that need real servers skip unless both variables are set. `TEST_DATABASE_URL` must belong to a role that may `CREATE DATABASE` (each test creates and drops a scratch database):
+
+```
+docker compose up -d postgres redis
+export TEST_DATABASE_URL=postgresql://pagemaster:pagemaster_dev@127.0.0.1:5432/postgres
+export TEST_REDIS_URL=redis://:pagemaster_redis_dev@127.0.0.1:6379/0
+pytest backend/tests -v
+```
+
+(PowerShell: `$env:TEST_DATABASE_URL = "..."`.) `test_postgres_integration.py` and `test_real_stack.py` then run. The latter starts the app as a subprocess, kills it mid-triage and checks recovery, runs a 60-alert storm, and cuts and restores Postgres and Redis through a TCP proxy. Use the compose passwords of your `.env` if you changed them.
+
+### CI
+
+`.github/workflows/ci.yml` runs `mypy --strict backend/app` and `pytest backend/tests -q` against Postgres and Redis service containers, then builds `backend/Dockerfile`, starts the compose stack and runs `scripts/smoke_compose.sh` (alert, page in the dry-run outbox, reply through `/api/demo/reply`, `RESOLVED`). Run the smoke test locally against a started stack with `sh scripts/smoke_compose.sh` (`BASE_URL` and `ALERT_WEBHOOK_SECRET` are honoured).
 
 ## Status
 

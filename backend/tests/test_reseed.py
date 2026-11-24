@@ -18,6 +18,7 @@ from backend.app.agents.graph import build_graph
 from backend.app.agents.ports import Ports
 from backend.app.api.routes import AppServices
 from backend.app.main import Settings, build_in_memory_services, create_app
+from backend.tests.test_api import live_settings
 from backend.app.mcp.server import (
     NO_RECENT_LOGS_REASON,
     Confidence,
@@ -219,7 +220,7 @@ def test_reseed_disabled_when_not_dry_run(services: AppServices) -> None:
         return 1
 
     svc = replace(services, reseed=reseed)
-    with TestClient(create_app(svc, Settings(frontend_dir=None, dry_run=False))) as c:
+    with TestClient(create_app(svc, live_settings())) as c:
         assert c.post("/api/demo/reseed").status_code in (404, 405)
     live = replace(svc, sms=_LiveSms())
     with TestClient(create_app(live, Settings(frontend_dir=None, dry_run=True))) as c:

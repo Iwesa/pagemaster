@@ -33,6 +33,10 @@ class SeenIdStore(Protocol):
         """Atomically record ``message_id``. True if first seen, False if a redelivery."""
         ...
 
+    async def forget(self, message_id: str) -> None:
+        """Undo a claim (best effort) so a provider redelivery is processed after an outage."""
+        ...
+
 
 class RedisSeenIdStore:
     """``redis.asyncio`` adapter using ``SET key 1 NX EX ttl``."""
@@ -45,6 +49,9 @@ class RedisSeenIdStore:
 
     async def claim(self, message_id: str) -> bool:
         return bool(await self._client.set(seen_key(message_id), "1", nx=True, ex=self._ttl))
+
+    async def forget(self, message_id: str) -> None:
+        await self._client.delete(seen_key(message_id))
 
 
 class InMemorySeenIdStore:
@@ -71,3 +78,6 @@ class InMemorySeenIdStore:
             return False
         self._seen[key] = now + self._ttl
         return True
+
+    async def forget(self, message_id: str) -> None:
+        self._seen.pop(seen_key(message_id), None)

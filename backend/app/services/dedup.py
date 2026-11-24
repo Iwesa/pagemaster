@@ -27,7 +27,7 @@ LOCK_KEY_PREFIX: Final[str] = "incident:lock:"
 
 # Terminal states that free the fingerprint before the TTL expires.
 TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
-    {"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED"}
+    {"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED", "NO_ACTION"}
 )
 
 _MAX_ACQUIRE_ATTEMPTS: Final[int] = 3
@@ -173,7 +173,7 @@ async def release_on_terminal(
     error_code: str,
     incident_id: UUID,
 ) -> bool:
-    """Release the fingerprint when ``status`` is ``RESOLVED``, ``BLOCKED_BY_TRIPWIRE``, ``FAILED`` or ``EXPIRED``.
+    """Release the fingerprint when ``status`` is ``RESOLVED``, ``BLOCKED_BY_TRIPWIRE``, ``FAILED``, ``EXPIRED`` or ``NO_ACTION``.
 
     Any other status leaves the lock in place and returns False.
     """

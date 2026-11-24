@@ -22,10 +22,12 @@ import asyncpg  # type: ignore[import-untyped]
 from backend.app.services.guardrails import AuditRecord, ResolutionGates
 from backend.app.services.incident_store import (
     SYSTEM_INCIDENT_ID,
+    TERMINAL_STATUSES,
     ActiveFingerprintError,
     ExpiryOutcome,
     IncidentRecord,
     IncidentStatus,
+    InflightStatus,
     ReclaimedIncident,
     TokenCollisionError,
     rechain,
@@ -33,7 +35,18 @@ from backend.app.services.incident_store import (
 
 SYSTEM_SERVICE_NAME: Final[str] = "_system"
 
-_COLUMNS: Final[str] = "incident_id, token, service_name, error_code, state, raw_alert, created_at, updated_at"
+_COLUMNS: Final[str] = (
+    "incident_id, token, service_name, error_code, state, raw_alert, "
+    "option_count, created_at, updated_at, terminal_at, duplicate_count"
+)
+
+_TERMINAL_LIST: Final[str] = ", ".join(f"'{s}'" for s in sorted(TERMINAL_STATUSES))
+
+
+def _terminal_at_for(state_param: str) -> str:
+    """SQL fragment stamping ``terminal_at`` (store clock) when ``state_param`` is terminal."""
+    return f"terminal_at = CASE WHEN {state_param}::text IN ({_TERMINAL_LIST}) THEN now() ELSE terminal_at END"
+
 
 _SQL_INSERT: Final[str] = (
     "INSERT INTO incidents (incident_id, token, service_name, error_code, state, raw_alert) "
@@ -55,29 +68,49 @@ _SQL_LIST_BY_STATES: Final[str] = (
     f"SELECT {_COLUMNS} FROM incidents WHERE state = ANY($1::text[]) AND incident_id <> $2 "
     "AND ($3::timestamptz IS NULL OR updated_at < $3) ORDER BY updated_at LIMIT $4"
 )
-_SQL_SET_STATE: Final[str] = "UPDATE incidents SET state = $2, updated_at = now() WHERE incident_id = $1"
+_SQL_SET_STATE: Final[str] = (
+    f"UPDATE incidents SET state = $2, updated_at = now(), {_terminal_at_for('$2')} WHERE incident_id = $1"
+)
 _SQL_RECORD_RESOLUTION: Final[str] = (
     "UPDATE incidents SET state = $2, "
     "tripwire_check_passed = COALESCE($3, tripwire_check_passed), "
     "simulated_step_executed = COALESCE($4, simulated_step_executed), "
     "confirmation_sms_sent = COALESCE($5, confirmation_sms_sent), "
     "audit_record_committed = COALESCE($6, audit_record_committed), "
-    "updated_at = now() WHERE incident_id = $1"
+    "option_count = COALESCE($7::smallint, option_count), "
+    f"updated_at = now(), {_terminal_at_for('$2')} WHERE incident_id = $1"
 )
 _SQL_CAS_STATE: Final[str] = (
-    "UPDATE incidents SET state = $3, updated_at = now() WHERE incident_id = $1 AND state = $2"
+    f"UPDATE incidents SET state = $3, updated_at = now(), {_terminal_at_for('$3')} "
+    "WHERE incident_id = $1 AND state = $2"
 )
 _SQL_RECONCILE_STALE: Final[str] = (
-    "UPDATE incidents SET state = 'FAILED', updated_at = now() "
+    "UPDATE incidents SET state = 'FAILED', updated_at = now(), terminal_at = now() "
     "WHERE state IN ('TRIAGING', 'EXECUTING') "
     "AND updated_at <= now() - make_interval(secs => $1::double precision) "
     "RETURNING incident_id, token, service_name, error_code"
 )
 _SQL_EXPIRE_STALE_AWAITING: Final[str] = (
-    "UPDATE incidents SET state = 'EXPIRED', updated_at = now() "
+    "UPDATE incidents SET state = 'EXPIRED', updated_at = now(), terminal_at = now() "
     "WHERE state = 'AWAITING_APPROVAL' "
     "AND updated_at <= now() - make_interval(secs => $1::double precision) "
     "RETURNING incident_id, token, service_name, error_code"
+)
+_SQL_FAIL_STALE_STATE: Final[str] = (
+    "UPDATE incidents SET state = 'FAILED', updated_at = now(), terminal_at = now() "
+    "WHERE state = $1 AND incident_id <> $3 "
+    "AND updated_at <= now() - make_interval(secs => $2::double precision) "
+    "RETURNING incident_id, token, service_name, error_code"
+)
+_SQL_RENEW_STALE_TRIAGING: Final[str] = (
+    "UPDATE incidents SET updated_at = now() "
+    "WHERE state = 'TRIAGING' AND incident_id <> $2 "
+    "AND updated_at <= now() - make_interval(secs => $1::double precision) "
+    "RETURNING incident_id, token, service_name, error_code"
+)
+_SQL_LATEST_BY_TOKEN: Final[str] = (
+    f"SELECT {_COLUMNS} FROM incidents WHERE token = $1 AND incident_id <> $2 "
+    "ORDER BY created_at DESC LIMIT 1"
 )
 _SQL_EXPIRE_IF_STALE: Final[str] = (
     "WITH cur AS ("
@@ -86,12 +119,22 @@ _SQL_EXPIRE_IF_STALE: Final[str] = (
     "FROM incidents WHERE token = $1 "
     "AND state IN ('TRIAGING', 'AWAITING_APPROVAL', 'EXECUTING') FOR UPDATE), "
     "upd AS ("
-    "UPDATE incidents i SET state = 'EXPIRED', updated_at = now() FROM cur "
+    "UPDATE incidents i SET state = 'EXPIRED', updated_at = now(), terminal_at = now() FROM cur "
     "WHERE i.incident_id = cur.incident_id AND cur.state = 'AWAITING_APPROVAL' AND cur.is_expired "
     "RETURNING i.incident_id) "
     "SELECT cur.incident_id, cur.state, cur.service_name, cur.error_code, cur.is_expired, "
     "(upd.incident_id IS NOT NULL) AS expired_now "
     "FROM cur LEFT JOIN upd ON upd.incident_id = cur.incident_id"
+)
+# Tokens that cannot be issued: active, or terminal for less than the cooldown (Req 9.1).
+_SQL_BUSY_TOKENS: Final[str] = (
+    f"SELECT token FROM incidents WHERE state NOT IN ({_TERMINAL_LIST}) "
+    "OR terminal_at > now() - make_interval(secs => $1::double precision)"
+)
+# One atomic statement; deliberately not filtered by state so a concurrently terminal incident still counts.
+_SQL_INCREMENT_DUPLICATES: Final[str] = (
+    "UPDATE incidents SET duplicate_count = COALESCE(duplicate_count, 0) + 1 "
+    "WHERE incident_id = $1 RETURNING duplicate_count"
 )
 _SQL_LOCK: Final[str] = "SELECT 1 FROM incidents WHERE incident_id = $1 FOR UPDATE"
 _SQL_CHAIN: Final[str] = (
@@ -130,8 +173,11 @@ def _to_incident(row: asyncpg.Record) -> IncidentRecord:
         error_code=row["error_code"],
         state=row["state"],
         raw_alert=_json_dict(row["raw_alert"]),
+        option_count=row["option_count"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        terminal_at=row["terminal_at"],
+        duplicate_count=row["duplicate_count"] or 0,
     )
 
 
@@ -257,6 +303,45 @@ class PostgresIncidentRepository:
             for r in rows
         ]
 
+    @staticmethod
+    def _reclaimed(rows: list[asyncpg.Record]) -> list[ReclaimedIncident]:
+        return [
+            ReclaimedIncident(
+                incident_id=r["incident_id"],
+                token=str(r["token"]).strip(),
+                service_name=r["service_name"],
+                error_code=r["error_code"],
+            )
+            for r in rows
+        ]
+
+    async def fail_stale_state(
+        self, state: InflightStatus, timeout_seconds: float
+    ) -> list[ReclaimedIncident]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_FAIL_STALE_STATE, state, float(timeout_seconds), SYSTEM_INCIDENT_ID)
+        return self._reclaimed(rows)
+
+    async def renew_stale_triaging(self, timeout_seconds: float) -> list[ReclaimedIncident]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_RENEW_STALE_TRIAGING, float(timeout_seconds), SYSTEM_INCIDENT_ID)
+        return self._reclaimed(rows)
+
+    async def latest_by_token(self, token: str) -> IncidentRecord | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_SQL_LATEST_BY_TOKEN, token, SYSTEM_INCIDENT_ID)
+        return None if row is None else _to_incident(row)
+
+    async def busy_tokens(self, cooldown_seconds: float) -> frozenset[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_SQL_BUSY_TOKENS, float(cooldown_seconds))
+        return frozenset(str(r["token"]).strip() for r in rows)
+
+    async def increment_duplicate_count(self, incident_id: UUID) -> int | None:
+        async with self._pool.acquire() as conn:
+            value = await conn.fetchval(_SQL_INCREMENT_DUPLICATES, incident_id)
+        return None if value is None else int(value)
+
     async def expire_if_stale(self, token: str, ttl_seconds: float) -> ExpiryOutcome:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(_SQL_EXPIRE_IF_STALE, token, float(ttl_seconds))
@@ -273,7 +358,11 @@ class PostgresIncidentRepository:
         )
 
     async def record_resolution(
-        self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None
+        self,
+        incident_id: UUID,
+        status: IncidentStatus,
+        gates: ResolutionGates | None,
+        option_count: int | None = None,
     ) -> bool:
         g = gates or ResolutionGates()
         async with self._pool.acquire() as conn:
@@ -285,6 +374,7 @@ class PostgresIncidentRepository:
                 g.simulated_step_executed,
                 g.confirmation_sms_sent,
                 g.audit_record_committed,
+                option_count,
             )
         return bool(result.endswith(" 1"))
 

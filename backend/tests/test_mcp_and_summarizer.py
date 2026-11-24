@@ -35,14 +35,20 @@ LOGS = "ERR 500 from 10.1.2.3 user bob@example.com Authorization: Bearer abc.def
 
 async def test_stdio_subprocess_degrades_when_db_unreachable() -> None:
     adapter = McpSubprocessTelemetry(UNREACHABLE_DSN, timeout=30.0, cwd=REPO_ROOT)
-    ctx = await adapter.get_incident_context("auth-db")
+    try:
+        ctx = await adapter.get_incident_context("auth-db")
+    finally:
+        await adapter.aclose()
     assert ctx.confidence == "DEGRADED"
     assert ctx.runbooks == ()
 
 
 async def test_stdio_timeout_degrades_without_raising() -> None:
     adapter = McpSubprocessTelemetry(UNREACHABLE_DSN, timeout=0.001, cwd=REPO_ROOT)
-    assert (await adapter.get_incident_context("auth-db")).confidence == "DEGRADED"
+    try:
+        assert (await adapter.get_incident_context("auth-db")).confidence == "DEGRADED"
+    finally:
+        await adapter.aclose()
 
 
 async def test_stdio_spawn_failure_degrades(tmp_path: Path) -> None:

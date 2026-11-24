@@ -41,7 +41,7 @@ def test_transliteration() -> None:
     assert to_gsm7_safe("`x` \u2018a\u2019 \u201cb\u201d c\u2014d\u2013e\u2026 5\u20ac") == (
         "'x' 'a' \"b\" c-d-e... 5EUR"
     )
-    assert to_gsm7_safe("caf\u00e9 \u00fc \u00a3") == "caf? ? ?"
+    assert to_gsm7_safe("caf\u00e9 \u00fc \u00a3") == "cafe u ?"
     out = to_gsm7_safe("\u4e2d\u6587 `tick` \u201cq\u201d")
     assert out.isascii()
     assert gsm7_septets(out) == len(out)
@@ -96,12 +96,12 @@ def test_validate_outbound_counts_septets() -> None:
 
 
 def test_payload_layout_with_titles() -> None:
-    payload = format_pager_payload("AB", "auth-db", "pool at 100%", "Reset connection pool", "Failover to replica")
-    assert payload.text == "INC-AB auth-db: pool at 100%. AB-1:Reset connection AB-2:Failover to"
+    payload = format_pager_payload("AB", "auth-db", "pool 99%", "Reset connection pool", "Failover to replica")
+    assert payload.text == "INC-AB auth-db: pool 99%. AB-1:Reset connection AB-2:Failover to"
     assert not payload.clamped
 
 
 def test_missing_titles_fall_back_and_codes_survive_long_input() -> None:
-    assert format_pager_payload("AB", "svc", "disk full").text.endswith("AB-1:Option 1 AB-2:Option 2")
+    assert format_pager_payload("AB", "svc", "disk full").text.endswith("AB-1:Option A AB-2:Option B")
     text = format_pager_payload("AB", "s" * 40, "x" * 400, "{" * 50, "~" * 50).text
     assert gsm7_septets(text) <= 160 and "AB-1:" in text and "AB-2:" in text

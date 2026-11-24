@@ -6,6 +6,7 @@ Flow::
         -> human_approval_gate (interrupt) -> tripwire_guard
         -> remediation_executor -> END          (tripwire passed)
                                 -> END          (BLOCKED_BY_TRIPWIRE)
+    dispatch_pager -> END                       (NO_ACTION: zero approved runbooks, or FAILED)
 
 Domain code only: all I/O goes through the typed ports in
 :mod:`backend.app.agents.ports`. ``AsyncPostgresSaver`` is imported lazily in
@@ -31,6 +32,7 @@ from langgraph.types import interrupt
 
 from backend.app.agents.ports import Ports, Runbook
 from backend.app.services.guardrails import (
+    MAX_PAGE_OPTIONS,
     AuditEvent,
     AuditLogger,
     AuditRecord,
@@ -43,15 +45,29 @@ from backend.app.services.guardrails import (
 
 logger = logging.getLogger("pagemaster.agents.graph")
 
-TELEMETRY_TIMEOUT_SECONDS: Final[float] = 5.0
+#: Overall bound on the triage telemetry lookup. It includes time queued behind the adapter's
+#: concurrency limit (Req 10.1); the adapter enforces its own 5 s per-call timeout.
+TELEMETRY_OVERALL_TIMEOUT_SECONDS: Final[float] = 60.0
 RUNBOOK_LOOKUP_TIMEOUT_SECONDS: Final[float] = 5.0
 REASON_LOOKUP_FAILED: Final[str] = "runbook_lookup_failed"
 
-IncidentStatus = Literal["TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE"]
+IncidentStatus = Literal[
+    "TRIAGING",
+    "AWAITING_APPROVAL",
+    "EXECUTING",
+    "RESOLVED",
+    "BLOCKED_BY_TRIPWIRE",
+    "FAILED",
+    "NO_ACTION",
+]
 Confidence = Literal["HIGH", "DEGRADED"]
 
 # Extra audit events emitted by the graph (free-form ``event_type`` strings).
 EVENT_PAGER_SENT: Final[str] = "PAGER_SENT"
+EVENT_PAGER_FAILED: Final[str] = "PAGER_FAILED"
+EVENT_PAGER_COALESCED: Final[str] = "PAGER_COALESCED"
+REASON_PAGE_RATE_LIMITED: Final[str] = "rate_limited"
+REASON_PAGER_UNDELIVERABLE: Final[str] = "pager_undeliverable"
 EVENT_APPROVAL_RECEIVED: Final[str] = "APPROVAL_RECEIVED"
 EVENT_REMEDIATION_EXECUTED: Final[str] = "REMEDIATION_EXECUTED"
 EVENT_REMEDIATION_FAILED: Final[str] = "REMEDIATION_FAILED"
@@ -74,6 +90,9 @@ class IncidentState(TypedDict, total=False):
     root_cause: str
     runbooks: list[dict[str, str]]  # Runbook.model_dump()
     pager_text: str
+    option_count: int  # reply options on the page, 0..MAX_PAGE_OPTIONS (Req 3.4-3.6)
+    failure_reason: str  # set with status FAILED (e.g. pager_undeliverable)
+    pager_coalesced: bool  # True: the page gate withheld the individual page (Req 10.3)
     choice: Literal["1", "2"] | None
     action_id: str
     target_host: str
@@ -121,6 +140,19 @@ async def _safe_send(ports: Ports, text: str) -> bool:
     return True
 
 
+async def _coalesced(ports: Ports, state: IncidentState, actionable: bool) -> bool:
+    """True when the page gate withheld this incident's page. A failing gate fails open (page)."""
+    assert ports.page_gate is not None
+    try:
+        decision = await ports.page_gate.admit(
+            token=state["token"], service_name=state["service_name"], actionable=actionable
+        )
+    except Exception:
+        logger.exception("page gate failed; sending the page individually")
+        return False
+    return decision == "COALESCED"
+
+
 # ---------------------------------------------------------------------------
 # Graph factory
 # ---------------------------------------------------------------------------
@@ -138,7 +170,7 @@ def build_graph(
         runbooks: list[Runbook] = []
         try:
             ctx = await asyncio.wait_for(
-                ports.telemetry.get_incident_context(service), TELEMETRY_TIMEOUT_SECONDS
+                ports.telemetry.get_incident_context(service), TELEMETRY_OVERALL_TIMEOUT_SECONDS
             )
             confidence = ctx.confidence
             # DEGRADED telemetry carries no real cause: keep the alert's own summary.
@@ -150,11 +182,9 @@ def build_graph(
         except Exception:  # includes TimeoutError; Req 2.3: never crash the workflow
             logger.warning("telemetry unavailable for %s; degrading", service)
             confidence = "DEGRADED"
-        if not runbooks:
-            try:
-                runbooks = list(await ports.runbooks.list_approved(service))
-            except Exception:
-                logger.warning("runbook lookup failed for %s", service)
+        # Req 10.2: the context just fetched is the only triage-time source of runbooks. A
+        # degraded or failed lookup yields none and never triggers a second telemetry call.
+        # (The Tripwire still re-queries ``ports.runbooks`` fresh at execution time.)
         return {
             "status": "TRIAGING",
             "confidence": confidence,
@@ -174,26 +204,53 @@ def build_graph(
         if state.get("confidence") == "DEGRADED":
             summary = f"[DEGRADED] {summary}"
         books = _runbooks(state)
+        offered = books[:MAX_PAGE_OPTIONS]  # one option per approved runbook (Req 3.4)
         payload = format_pager_payload(
-            state["token"],
-            service,
-            summary,
-            books[0].title if len(books) > 0 else None,
-            books[1].title if len(books) > 1 else None,
+            state["token"], service, summary, option_titles=[b.title for b in offered]
         )
         audit = _Audit(state, ports)
         if payload.audit_event is not None:  # Req 3.3
             await audit.emit(
                 payload.audit_event, {"reasons": [str(r) for r in payload.reasons]}
             )
-        return {"pager_text": payload.text, "audit_records": audit.dump()}
+        return {
+            "pager_text": payload.text,
+            "option_count": len(offered),
+            "audit_records": audit.dump(),
+        }
 
     async def dispatch_pager(state: IncidentState) -> dict[str, Any]:
         audit = _Audit(state, ports)
-        sent = await _safe_send(ports, state["pager_text"])
-        await audit.emit(EVENT_PAGER_SENT, {"token": state["token"], "sent": sent})
+        option_count = state.get("option_count", min(len(state.get("runbooks", [])), MAX_PAGE_OPTIONS))
+        if ports.page_gate is not None and await _coalesced(ports, state, option_count > 0):
+            # Req 10.3: over the page rate. The incident is still triaged and keeps its normal
+            # next state, but no individual page goes out (no PAGER_SENT); the gate summarises it.
+            await audit.emit(EVENT_PAGER_COALESCED, {"reason": REASON_PAGE_RATE_LIMITED})
+            return {
+                "status": "AWAITING_APPROVAL" if option_count > 0 else "NO_ACTION",
+                "pager_coalesced": True,
+                "audit_records": audit.dump(),
+            }
+        try:
+            # The SmsPort adapter owns retry/backoff; an exception here is final (Req 8.1, 8.2).
+            await ports.sms.send(state["pager_text"])
+        except Exception:
+            logger.warning("pager undeliverable for incident %s", state["incident_id"])
+            await audit.emit(EVENT_PAGER_FAILED, {"reason": REASON_PAGER_UNDELIVERABLE})
+            return {
+                "status": "FAILED",
+                "failure_reason": REASON_PAGER_UNDELIVERABLE,
+                "audit_records": audit.dump(),
+            }
+        await audit.emit(EVENT_PAGER_SENT, {"token": state["token"]})  # Req 8.3: exactly one
+        if option_count <= 0:
+            # Req 3.5: no approved action. The page was sent; nobody can reply, so end here.
+            return {"status": "NO_ACTION", "audit_records": audit.dump()}
         # Req 4.1: transition to AWAITING_APPROVAL; checkpoint is written by the saver.
         return {"status": "AWAITING_APPROVAL", "audit_records": audit.dump()}
+
+    def route_after_dispatch(state: IncidentState) -> Literal["human_approval_gate", "__end__"]:
+        return "__end__" if state.get("status") in ("FAILED", "NO_ACTION") else "human_approval_gate"
 
     async def human_approval_gate(state: IncidentState) -> dict[str, Any]:
         resume: object = interrupt({"status": "AWAITING_APPROVAL", "token": state["token"]})
@@ -307,7 +364,7 @@ def build_graph(
     builder.add_edge(START, "triage_worker")
     builder.add_edge("triage_worker", "supervisor_formatter")
     builder.add_edge("supervisor_formatter", "dispatch_pager")
-    builder.add_edge("dispatch_pager", "human_approval_gate")
+    builder.add_conditional_edges("dispatch_pager", route_after_dispatch)
     builder.add_edge("human_approval_gate", "tripwire_guard")
     builder.add_conditional_edges("tripwire_guard", route_after_tripwire)
     builder.add_edge("remediation_executor", END)

@@ -56,6 +56,21 @@ class SmsPort(Protocol):
     async def send(self, text: str) -> None: ...
 
 
+PageDecision = Literal["SEND", "COALESCED"]
+
+
+@runtime_checkable
+class PageGate(Protocol):
+    """Page rate gate (Req 10.3). Decides whether an incident's own page may go out now.
+
+    ``"SEND"``: the caller sends the individual page. ``"COALESCED"``: the gate has taken
+    ownership of the incident (it will appear in a later summary page) and the caller must
+    not send an individual page. Each call is decided exactly once.
+    """
+
+    async def admit(self, *, token: str, service_name: str, actionable: bool) -> PageDecision: ...
+
+
 @runtime_checkable
 class AuditPort(Protocol):
     """Durably persists one hash-chained audit record. Raises on failure."""
@@ -81,3 +96,4 @@ class Ports:
     audit: AuditPort
     runbooks: RunbookPort
     summarizer: SummarizerPort | None = None
+    page_gate: PageGate | None = None

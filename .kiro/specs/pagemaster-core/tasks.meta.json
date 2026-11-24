@@ -805,6 +805,235 @@
         "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
         "timestamp": 1794732217307
       }
+    ],
+    "16. Total incident lifecycle: periodic recovery, notifications, expiry replies": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502480733
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502508581
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795503765985
+      }
+    ],
+    "17. Reliable page delivery": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502484632
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795503767693
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795504740365
+      }
+    ],
+    "18. Truthful page options and no dead ends": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502486664
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795504741585
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795505991311
+      }
+    ],
+    "19. Forgiving, informative replies": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502489722
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795505988280
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795506823947
+      }
+    ],
+    "20. Token cooldown and exhaustion": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502491387
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795506822354
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795507777336
+      }
+    ],
+    "21. Request limits and dedup audit cap": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502492753
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795507778793
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795508712353
+      }
+    ],
+    "22. Overload control: telemetry concurrency and page rate": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502493187
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795508715307
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795510739019
+      }
+    ],
+    "23. Dependency failures and health endpoints": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502493641
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795510745035
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795513014213
+      }
+    ],
+    "24. Live-mode lockdown and config validation": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502494447
+      },
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795513016290
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795519089212
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795519098151
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795520166527
+      }
+    ],
+    "25. Sanitiser: secrets, injection, transliteration": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502495091
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795520169612
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795520563132
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795520576702
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795524011385
+      }
+    ],
+    "26. Database scripts: idempotent and split": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502495861
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795524013357
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795524923131
+      }
+    ],
+    "27. Chaos and soak suite, Docker verification in CI": [
+      {
+        "executionId": "67d3d5d1-fc8a-4a76-8d98-c02da0546a2c",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795502496979
+      },
+      {
+        "executionId": "a74e15e5-9466-4a76-afdd-3676e845c33e",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795524927676
+      },
+      {
+        "executionId": "fa4ff111-464f-4b41-a6ff-6abbfe81de49",
+        "chatSessionId": "sess_4a6b62a9-bb09-482b-9323-f6a8e0683050",
+        "timestamp": 1795528100912
+      },
+      {
+        "executionId": "d07315db-e37e-4024-b670-00fb20d09dd3",
+        "chatSessionId": "sess_4ba3de93-fbee-4d78-ba57-cb70871ba516",
+        "timestamp": 1795528515798
+      }
     ]
   }
 }

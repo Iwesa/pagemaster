@@ -31,6 +31,18 @@ def _at_settings(**overrides: Any) -> AfricasTalkingSettings:
     }
     return AfricasTalkingSettings(**{**base, **overrides})
 
+def live_settings(**overrides: Any) -> Settings:
+    """Complete live-mode (dry_run=false) settings that pass `validate_for_runtime`."""
+    base: dict[str, Any] = {
+        "frontend_dir": None,
+        "dry_run": False,
+        "alert_webhook_secret": "alert-secret",
+        "api_read_secret": SecretStr("read-secret"),
+        "africastalking": _at_settings(username="u", api_key=SecretStr("k")),
+    }
+    return Settings(**{**base, **overrides})
+
+
 ALERT = {"service_name": "auth-db", "error_code": "DB_POOL_EXHAUSTED", "summary": "pool at 100%"}
 
 
@@ -247,7 +259,7 @@ def test_valid_reply_resumes_and_resolves(client: TestClient, services: AppServi
     # A second reply to the now-resolved token mutates nothing.
     before = _run(services.audit.records(incident_id))
     assert _sms(client, f"{token}-1").status_code == 200
-    assert "no longer active" in _outbox(services)[-1]
+    assert _outbox(services)[-1] == f"INC-{token} already handled (RESOLVED)."  # Req 4.11, just resolved
     assert _run(services.audit.records(incident_id)) == before
 
 
@@ -328,11 +340,19 @@ def test_public_api_does_not_expose_reply_token(client: TestClient, services: Ap
     assert [r["hash"] for r in audit["records"]] == [r.hash for r in stored]
 
 
-def test_demo_routes_disabled_when_not_dry_run(client: TestClient, services: AppServices) -> None:
+def test_demo_routes_disabled_when_not_dry_run(services: AppServices) -> None:
     # Not registered when Settings.dry_run is false.
     # (405 when the static UI mount at "/" answers instead of the API.)
-    assert client.post("/api/demo/reply", json={"token": "AB", "choice": 1}).status_code in (404, 405)
-    assert client.get("/api/demo/outbox").status_code == 404
+    live_cfg = Settings(
+        frontend_dir=None,
+        dry_run=False,
+        alert_webhook_secret="alert-secret",
+        api_read_secret=SecretStr("read-secret"),
+        africastalking=_at_settings(username="u", api_key=SecretStr("k")),
+    )
+    with TestClient(create_app(services, live_cfg)) as lc:
+        assert lc.post("/api/demo/reply", json={"token": "AB", "choice": 1}).status_code in (404, 405)
+        assert lc.get("/api/demo/outbox").status_code in (404, 405)
     # Registered but the SMS adapter is not in dry-run: still 404 (defence in depth).
     live = AppServices(
         graph=services.graph,
@@ -449,7 +469,7 @@ def test_healthz_ok_unauthenticated_even_with_secrets(secured: tuple[TestClient,
 
 @pytest.mark.parametrize("dry_run", [True, False])
 def test_healthz_registered_regardless_of_dry_run(services: AppServices, dry_run: bool) -> None:
-    with TestClient(create_app(services, Settings(frontend_dir=None, dry_run=dry_run))) as c:
+    with TestClient(create_app(services, (Settings(frontend_dir=None) if dry_run else live_settings()))) as c:
         assert c.get("/healthz").json() == {"status": "ok"}
 
 
@@ -460,29 +480,16 @@ def test_healthz_not_shadowed_by_static_mount(services: AppServices, tmp_path: A
         assert c.get("/healthz").json() == {"status": "ok"}
 
 
-def test_healthz_503_without_leaking_details_when_ping_fails(services: AppServices) -> None:
+def test_healthz_stays_200_when_dependencies_fail(services: AppServices) -> None:
+    import dataclasses
+
     async def boom() -> None:
         raise RuntimeError("postgres://user:secret@db/pagemaster refused")
 
-    import dataclasses
-
-    failing = dataclasses.replace(services, ping=boom)
+    failing = dataclasses.replace(services, ping_postgres=boom, ping_redis=boom)
     with TestClient(create_app(failing, Settings(frontend_dir=None))) as c:
         resp = c.get("/healthz")
-    assert resp.status_code == 503
-    assert resp.json() == {"status": "unavailable"}
-    assert "secret" not in resp.text
-
-
-def test_healthz_200_when_ping_succeeds(services: AppServices) -> None:
-    import dataclasses
-
-    async def fine() -> None:
-        return None
-
-    with TestClient(create_app(dataclasses.replace(services, ping=fine), Settings(frontend_dir=None))) as c:
-        assert c.get("/healthz").status_code == 200
-
+    assert resp.status_code == 200 and resp.json() == {"status": "ok"}
 
 # ---------------------------------------------------------------------------
 # Webhook secret transport (task 15.3)

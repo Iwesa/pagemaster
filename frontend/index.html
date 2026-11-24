@@ -37,6 +37,9 @@
   .page { color:#9aa; font:11px Arial,sans-serif; letter-spacing:1px; }
   .secret { width:100%; padding:6px; border-radius:6px; border:1px solid #000; background:#d7d7d7;
             font:12px "Courier New",monospace; }
+  .banner { background:#8a5a00; color:#fff; font:bold 12px Arial,sans-serif; letter-spacing:1px;
+            text-align:center; padding:6px; border-radius:6px; margin-bottom:8px; }
+  .banner[hidden] { display:none; }
   .blink { animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity:0; } }
 </style>
@@ -46,6 +49,7 @@
      It is kept in the input element only (never stored) and sent as "Authorization: Bearer <secret>"
      with the simulated alert buttons. Without it those buttons get 401. -->
 <main class="pager">
+  <div class="banner" id="banner" hidden></div>
   <div class="brand"><span>MOTOROLA</span><span>ADVISOR</span></div>
   <section class="lcd" aria-live="polite">
     <div class="status"><span id="conn">LINK ...</span><span id="clock">--:--:--</span></div>
@@ -61,6 +65,9 @@
 
   <div class="label">ALERT SECRET (ONLY IF ALERT_WEBHOOK_SECRET IS SET)</div>
   <input class="secret" id="secret" type="password" autocomplete="off" placeholder="bearer secret (memory only)">
+
+  <div class="label">READ KEY (ONLY IF API_READ_SECRET IS SET, LIVE MODE)</div>
+  <input class="secret" id="readkey" type="password" autocomplete="off" placeholder="read key (memory only)">
 
   <div class="label">SIMULATE ALERT</div>
   <div class="buttons" id="alerts"></div>
@@ -86,6 +93,7 @@
   var $ = function (id) { return document.getElementById(id); };
   var conn = $("conn"), clock = $("clock"), msg = $("msg"), count = $("count"), list = $("list");
   var r1 = $("r1"), r2 = $("r2"), nextBtn = $("next"), pageEl = $("page"), secretEl = $("secret");
+  var bannerEl = $("banner"), readKeyEl = $("readkey");
   var awaiting = [];          // AWAITING_APPROVAL incidents, as returned by the API
   var selectedId = null;      // incident_id; stays stable across polls while still awaiting
   var lastOutbox = [];
@@ -94,6 +102,9 @@
   var demoEnabled = true;
 
   function setText(el, text) { el.textContent = text; }
+
+  // NO_ACTION: the page had no approved runbook, so a human must respond manually.
+  var STATE_LABELS = { NO_ACTION: "NO ACTION" };
 
   function api(method, path, body, extraHeaders) {
     var opts = { method: method, headers: extraHeaders || {} };
@@ -139,6 +150,11 @@
     var code = awaitingId !== null ? codeFrom(messageFor(awaitingId)) : null;
     setText(r1, code ? code + "-1" : "-1");
     setText(r2, code ? code + "-2" : "-2");
+    var pageText = awaitingId !== null ? messageFor(awaitingId) : null;
+    if (code && pageText !== null) {   // only offer the options the page really lists
+      r1.disabled = !canReply || pageText.indexOf(code + "-1") < 0;
+      r2.disabled = !canReply || pageText.indexOf(code + "-2") < 0;
+    }
 
     if (!demoEnabled) {
       setText(msg, lastIncidents.length === 0 ? "NO MESSAGES" : "LIVE MODE: PAGES SENT BY SMS");
@@ -161,7 +177,7 @@
       var left = document.createElement("span");
       var right = document.createElement("span");
       setText(left, inc.service_name + " " + inc.error_code);
-      setText(right, String(inc.state).replace("_", " "));
+      setText(right, STATE_LABELS[inc.state] || String(inc.state).replace("_", " "));
       row.appendChild(left);
       row.appendChild(right);
       list.appendChild(row);
@@ -176,8 +192,21 @@
     var s = secretEl.value;
     return s ? { "Authorization": "Bearer " + s } : {};
   }
+  function readHeaders() {
+    var k = readKeyEl.value;
+    return k ? { "Authorization": "Bearer " + k } : {};
+  }
+  // Banner only while /readyz reports dry_run true; hidden otherwise or when unreachable. textContent only.
+  function pollBanner() {
+    fetch("/readyz").then(function (res) { return res.json(); }).then(function (body) {
+      var dry = body !== null && body.dry_run === true;
+      setText(bannerEl, dry ? "DRY RUN - SIMULATED PAGES, NO REAL SMS" : "");
+      bannerEl.hidden = !dry;
+    }).catch(function () { setText(bannerEl, ""); bannerEl.hidden = true; });
+  }
   function poll() {
-    var incidentsP = api("GET", "/api/incidents");
+    pollBanner();
+    var incidentsP = api("GET", "/api/incidents", undefined, readHeaders());
     var outboxP = api("GET", "/api/demo/outbox?limit=100").catch(function (e) {
       if (e.status === 404) { demoEnabled = false; return null; }
       throw e;
@@ -187,8 +216,8 @@
       renderIncidents(res[0]);
       lastOutbox = res[1] !== null ? res[1] : [];
       renderPager();
-    }).catch(function () {
-      setText(conn, "NO LINK");
+    }).catch(function (e) {
+      setText(conn, e && e.status === 401 ? "READ KEY NEEDED" : "NO LINK");
     });
   }
 

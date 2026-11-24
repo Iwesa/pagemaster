@@ -58,7 +58,21 @@ class AfricasTalkingConfigError(RuntimeError):
 
 
 class SmsSendError(RuntimeError):
-    """Africa's Talking rejected the message or the request failed."""
+    """Africa's Talking rejected the message or the request failed.
+
+    ``retryable`` is True for transient failures (transport errors, timeouts, HTTP 5xx, 408,
+    429, provider-side recipient codes >= 500) and False for errors a retry cannot fix
+    (authentication, invalid number, insufficient balance). It defaults to True so existing
+    ``SmsSendError("...")`` callers are unchanged.
+    """
+
+    def __init__(self, message: str = "", *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _http_status_retryable(status: int) -> bool:
+    return status >= 500 or status in (408, 429)
 
 
 _BEARER_PREFIX: Final[str] = "bearer "
@@ -206,7 +220,10 @@ class AfricasTalkingSmsAdapter:
         except httpx.HTTPError as exc:
             raise SmsSendError(f"africastalking request failed: {type(exc).__name__}") from exc
         if not response.is_success:
-            raise SmsSendError(f"africastalking returned HTTP {response.status_code}")
+            raise SmsSendError(
+                f"africastalking returned HTTP {response.status_code}",
+                retryable=_http_status_retryable(response.status_code),
+            )
         self._check_recipients(response)
 
     @staticmethod
@@ -215,14 +232,17 @@ class AfricasTalkingSmsAdapter:
             body: Any = response.json()
             recipients = body["SMSMessageData"]["Recipients"]
         except (ValueError, KeyError, TypeError) as exc:
-            raise SmsSendError("africastalking response was malformed") from exc
+            raise SmsSendError("africastalking response was malformed", retryable=False) from exc
         if not isinstance(recipients, list) or not recipients:
             raise SmsSendError("africastalking reported no recipients")
         for recipient in recipients:
             code = recipient.get("statusCode") if isinstance(recipient, dict) else None
             if code not in _OK_STATUS_CODES:
                 status = recipient.get("status", "unknown") if isinstance(recipient, dict) else "?"
-                raise SmsSendError(f"africastalking recipient failed: {code} {status}")
+                raise SmsSendError(
+                    f"africastalking recipient failed: {code} {status}",
+                    retryable=isinstance(code, int) and code >= 500,
+                )
 
     async def aclose(self) -> None:
         """Close the live HTTP client, if any."""

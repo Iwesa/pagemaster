@@ -5,9 +5,14 @@ services:
       POSTGRES_USER: pagemaster
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pagemaster_dev}
       POSTGRES_DB: pagemaster
+      # 00_init.sh applies 10_schema.sql and 20_roles.sql, and 30_demo_seed.sql only when true.
+      DEMO_SEED: ${DRY_RUN:-true}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./database/init_mock_logs.sql:/docker-entrypoint-initdb.d/01_init_mock_logs.sql:ro
+      - ./database/docker-entrypoint/00_init.sh:/docker-entrypoint-initdb.d/00_init.sh:ro
+      - ./database/10_schema.sql:/pagemaster-sql/10_schema.sql:ro
+      - ./database/20_roles.sql:/pagemaster-sql/20_roles.sql:ro
+      - ./database/30_demo_seed.sql:/pagemaster-sql/30_demo_seed.sql:ro
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
@@ -44,15 +49,26 @@ services:
       USE_IN_MEMORY: ${USE_IN_MEMORY:-false}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       ALERT_WEBHOOK_SECRET: ${ALERT_WEBHOOK_SECRET:-}
+      API_READ_SECRET: ${API_READ_SECRET:-}
       DRY_RUN: ${DRY_RUN:-true}
       AFRICASTALKING_USERNAME: ${AFRICASTALKING_USERNAME:-}
       AFRICASTALKING_API_KEY: ${AFRICASTALKING_API_KEY:-}
       AFRICASTALKING_SHORTCODE: ${AFRICASTALKING_SHORTCODE:-}
+      AFRICASTALKING_SANDBOX: ${AFRICASTALKING_SANDBOX:-false}
       AFRICASTALKING_WEBHOOK_SECRET: ${AFRICASTALKING_WEBHOOK_SECRET:-}
       ONCALL_PHONE_NUMBER: ${ONCALL_PHONE_NUMBER:-}
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-900}
       REAPER_INTERVAL_SECONDS: ${REAPER_INTERVAL_SECONDS:-30}
       INFLIGHT_STALE_SECONDS: ${INFLIGHT_STALE_SECONDS:-60}
+      TRIAGE_TIMEOUT_SECONDS: ${TRIAGE_TIMEOUT_SECONDS:-120}
+      EXECUTING_TIMEOUT_SECONDS: ${EXECUTING_TIMEOUT_SECONDS:-120}
+      PAGE_MAX_ATTEMPTS: ${PAGE_MAX_ATTEMPTS:-3}
+      TOKEN_COOLDOWN_SECONDS: ${TOKEN_COOLDOWN_SECONDS:-3600}
+      MAX_ALERT_BODY_BYTES: ${MAX_ALERT_BODY_BYTES:-65536}
+      DEDUP_AUDIT_SAMPLE: ${DEDUP_AUDIT_SAMPLE:-20}
+      TELEMETRY_MAX_CONCURRENCY: ${TELEMETRY_MAX_CONCURRENCY:-4}
+      PAGE_RATE_PER_MINUTE: ${PAGE_RATE_PER_MINUTE:-6}
+      PAGE_FAILURE_READY_THRESHOLD: ${PAGE_FAILURE_READY_THRESHOLD:-3}
       ALLOW_QUERY_SECRET: ${ALLOW_QUERY_SECRET:-false}
     depends_on:
       postgres:
@@ -66,9 +82,9 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3).status==200 else 1)"
       interval: 10s
-      timeout: 5s
+      timeout: 4s
       retries: 5
       start_period: 20s
 

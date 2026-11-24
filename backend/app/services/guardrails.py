@@ -11,7 +11,7 @@ Covers:
   * Req 5.3 / Property 5:     ``AuditLogger``, ``compute_audit_hash``, ``verify_chain``.
   * Req 5.4-5.5 / Property 5: ``ResolutionGates`` and ``can_resolve``.
 
-Audit hash contract (must match ``database/init_mock_logs.sql``)::
+Audit hash contract (must match ``database/30_demo_seed.sql`` (seed) and ``10_schema.sql``)::
 
     hash = hex(sha256(utf8(
         prev_hash '|' incident_id '|' seq '|' event_type '|' payload_text)))
@@ -33,6 +33,7 @@ import ipaddress
 import json
 import math
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
@@ -50,6 +51,8 @@ PAGER_MAX_CHARS: Final[int] = 160
 GENESIS_HASH: Final[str] = "0" * 64
 REDACTION: Final[str] = "***"
 _MAX_SERVICE_CHARS: Final[int] = 32
+#: A service name starting with 1 or 2 would complete ``INC-AB 1...`` into a reply lookalike.
+_LEADING_DIGIT_RE: Final[re.Pattern[str]] = re.compile(r"[12]")
 _TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"[A-Z0-9]{2}", re.ASCII)
 
 
@@ -78,6 +81,34 @@ _IPV6_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(
 )
 _IPV4_RE: Final[re.Pattern[str]] = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 _SECRET_CANDIDATE_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9+/=_\-]{20,}")
+_UUID_RE: Final[re.Pattern[str]] = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
+# ``key=value`` / ``key: value`` secrets (Req 3.7). The key may carry a closing quote (JSON
+# style); the value is quoted, or runs to the next whitespace, comma, semicolon or quote. A scheme
+# word (``Basic``, ``Digest``...) before the credential is part of the value.
+_SECRET_KEYS: Final[str] = (
+    r"password|passwd|pwd|secret|token|api[_\-]?key|authorization|auth|credentials?|"
+    r"client[_\-]secret|access[_\-]key|private[_\-]key"
+)
+_KV_VALUE: Final[str] = r"""(?:"[^"]*"|'[^']*'|[^\s,;"']+)"""
+_KV_RE: Final[re.Pattern[str]] = re.compile(
+    rf"""(?:{_SECRET_KEYS})["']?\s*[:=]\s*"""
+    rf"""(?:(?:basic|digest|negotiate|token|apikey)\s+(?={_KV_VALUE}))?{_KV_VALUE}""",
+    re.IGNORECASE,
+)
+# Provider token formats. Prefix-anchored, so no boundary is needed except for ``sk-``, which
+# also ends words such as ``task-`` and ``desk_``.
+_TOKEN_FORMAT_RES: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"(?<![A-Za-z0-9])sk[-_][A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}"),
+    re.compile(r"xox[abprs]-[A-Za-z0-9\-]+"),
+    re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{30,}"),
+)
+#: Long hex digests/keys. Low-entropy runs (``aaaa...``) are padding, not secrets.
+_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9A-Fa-f]{32,}")
+_HEX_MIN_ENTROPY: Final[float] = 3.0
 _WS_RE: Final[re.Pattern[str]] = re.compile(r"\s+", re.ASCII)
 
 
@@ -137,7 +168,12 @@ def _looks_like_secret(candidate: str) -> bool:
 
 
 def _redact_secret_candidate(match: re.Match[str]) -> str:
-    return REDACTION if _looks_like_secret(match.group(0)) else match.group(0)
+    candidate = match.group(0)
+    # UUIDs (8-4-4-4-12 hex) are identifiers, not secrets: leave them alone, also with a
+    # short prefix such as ``req-`` attached.
+    if _UUID_RE.search(candidate) and len(_UUID_RE.sub("", candidate)) < 20:
+        return candidate
+    return REDACTION if _looks_like_secret(candidate) else candidate
 
 
 class ClampReason(StrEnum):
@@ -147,6 +183,7 @@ class ClampReason(StrEnum):
     NON_ASCII = "NON_ASCII"
     TRANSLITERATED = "TRANSLITERATED"
     TRUNCATED = "TRUNCATED"
+    CODE_NEUTRALIZED = "CODE_NEUTRALIZED"
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +266,42 @@ def clamp_to_septets(text: str, limit: int = PAGER_MAX_CHARS) -> str:
     return text
 
 
+#: Invisible characters removed outright (zero-width space/joiners, word joiner, BOM, soft hyphen).
+_DROPPED: Final[frozenset[str]] = frozenset("\u200b\u200c\u200d\u2060\ufeff\u00ad")
+#: Letters with no NFKD decomposition into base letter plus mark.
+_LETTER_FOLDS: Final[Mapping[str, str]] = {
+    "\u00df": "ss",
+    "\u00e6": "ae",
+    "\u00c6": "AE",
+    "\u00f8": "o",
+    "\u00d8": "O",
+    "\u0153": "oe",
+    "\u0152": "OE",
+    "\u0142": "l",
+    "\u0141": "L",
+    "\u0111": "d",
+    "\u0110": "D",
+    "\u0131": "i",
+}
+
+
+def _fold_non_ascii(ch: str) -> str | None:
+    """ASCII rendering of one non-ASCII character, or ``None`` when it has none.
+
+    Order: explicit table (smart quotes, dashes, ellipsis, euro...), whitespace, letter folds,
+    then NFKD with the combining marks removed (``e`` + acute -> ``e``, full-width ``A`` -> ``A``).
+    """
+    mapped = _TRANSLITERATIONS.get(ch) or _LETTER_FOLDS.get(ch)
+    if mapped is not None:
+        return mapped
+    if ch.isspace():
+        return " "
+    base = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c))
+    if base and all(" " <= c <= "~" for c in base):
+        return base
+    return None
+
+
 def transliterate_gsm7(text: str) -> tuple[str, bool, bool]:
     """Fold ``text`` to printable ASCII that is also encodable in GSM-7.
 
@@ -240,19 +313,31 @@ def transliterate_gsm7(text: str) -> tuple[str, bool, bool]:
     out: list[str] = []
     transliterated = False
     replaced = False
+    in_run = False  # inside a run of unmappable characters (they share one ``?``)
     for ch in text:
-        mapped = _TRANSLITERATIONS.get(ch)
         code = ord(ch)
-        if mapped is not None:
-            out.append(mapped)
+        if code < 128:
+            in_run = False
+            if ch in _TRANSLITERATIONS:
+                out.append(_TRANSLITERATIONS[ch])
+                transliterated = True
+            elif code < 32 or code == 127:
+                out.append(" ")
+            else:
+                out.append(ch)
+            continue
+        if ch in _DROPPED or unicodedata.combining(ch):
+            transliterated = True  # invisible: no output and no effect on the current run
+            continue
+        folded = _fold_non_ascii(ch)
+        if folded is not None:
+            out.append(folded)
             transliterated = True
-        elif code > 127:
+            in_run = False
+        elif not in_run:
             out.append("?")
             replaced = True
-        elif code < 32 or code == 127:
-            out.append(" ")
-        else:
-            out.append(ch)
+            in_run = True
     return "".join(out), transliterated, replaced
 
 
@@ -270,16 +355,52 @@ def _ascii_clean(text: str) -> tuple[str, bool, bool]:
     return _WS_RE.sub(" ", folded).strip(), replaced, transliterated
 
 
-def _redact(text: str) -> tuple[str, int]:
-    """Apply every redaction rule; return (text, number_of_redactions)."""
+def _redact_kv(text: str) -> tuple[str, int]:
+    count = 0
+
+    def _sub(match: re.Match[str]) -> str:
+        nonlocal count
+        if not match.group(0).endswith(REDACTION):  # an already redacted value is not news
+            count += 1
+        return REDACTION
+
+    return _KV_RE.sub(_sub, text), count
+
+
+def _redact(text: str, *, kv: bool = True) -> tuple[str, int]:
+    """Apply every redaction rule; return (text, number_of_redactions).
+
+    ``kv=False`` skips the ``key: value`` rule. It is for checks over an assembled page,
+    where ``<service>: <summary>`` (for example ``auth: db down``) is layout, not a secret.
+    """
     total = 0
-    for pattern in (_BEARER_RE, _JWT_RE, _EMAIL_RE):
-        text, n = pattern.subn(REDACTION, text)
+    text, n = _BEARER_RE.subn(REDACTION, text)
+    total += n
+    if kv:  # before the JWT rule: a JWT run may otherwise swallow the key of a following pair
+        text, n = _redact_kv(text)
         total += n
+    text, n = _JWT_RE.subn(REDACTION, text)
+    total += n
+    text, n = _EMAIL_RE.subn(REDACTION, text)
+    total += n
     text, n = _redact_ipv6(text)
     total += n
     text, n = _IPV4_RE.subn(REDACTION, text)
     total += n
+    for token_re in _TOKEN_FORMAT_RES:
+        text, n = token_re.subn(REDACTION, text)
+        total += n
+    hex_hits = 0
+
+    def _hex(match: re.Match[str]) -> str:
+        nonlocal hex_hits
+        if _shannon_entropy(match.group(0)) < _HEX_MIN_ENTROPY:
+            return match.group(0)
+        hex_hits += 1
+        return REDACTION
+
+    text = _HEX_RE.sub(_hex, text)
+    total += hex_hits
     redacted: list[str] = []
 
     def _count(match: re.Match[str]) -> str:
@@ -292,6 +413,30 @@ def _redact(text: str) -> tuple[str, int]:
     return text, total + len(redacted)
 
 
+# ---------------------------------------------------------------------------
+# Reply-code injection (Req 3.8)
+# ---------------------------------------------------------------------------
+
+#: Anything ``parse_sms_reply`` could take for a reply once it is on its own: two alphanumerics,
+#: ``-`` or a space, then ``1`` or ``2``. There is no boundary on either side on purpose:
+#: ``web-1`` is rewritten because the window ``eb-1`` is a valid reply, and ``ab-12`` is rewritten
+#: so truncating text after the digit can never create a code.
+_CODE_LOOKALIKE_RE: Final[re.Pattern[str]] = re.compile(
+    r"([A-Za-z0-9]{2})[- ](?=[12])", re.ASCII
+)
+
+
+def neutralize_reply_codes(text: str) -> tuple[str, bool]:
+    """Rewrite every reply-code lookalike in ASCII ``text`` so it cannot be replied verbatim.
+
+    ``AB-1`` / ``ab 2`` become ``AB_1`` / ``ab_2``. Run on untrusted text (alert summary, log
+    line, LLM output, service name, runbook title) before the real ``<TOKEN>-N`` options are
+    appended, so those are the only codes on the page (Req 3.8). Returns ``(text, changed)``.
+    """
+    out, count = _CODE_LOOKALIKE_RE.subn(r"\1_", text)
+    return out, count > 0
+
+
 class SanitizeResult(BaseModel):
     """Outcome of :func:`sanitize_with_report`."""
 
@@ -301,23 +446,36 @@ class SanitizeResult(BaseModel):
     redactions: int = Field(ge=0)
     non_ascii_replaced: bool
     transliterated: bool = False
+    neutralized: bool = False
 
 
-def sanitize_with_report(text: str) -> SanitizeResult:
-    """Sanitise ``text`` and report whether anything was redacted/replaced."""
+def sanitize_with_report(text: str, *, neutralize_codes: bool = True) -> SanitizeResult:
+    """Sanitise ``text`` and report whether anything was redacted/replaced.
+
+    Pipeline: transliterate to ASCII, redact secrets and PII, neutralise reply-code lookalikes.
+    Redaction runs here, before any truncation by the callers.
+    """
     cleaned, non_ascii, translit = _ascii_clean(text)
     redacted, count = _redact(cleaned)
+    neutralized = False
+    if neutralize_codes:
+        redacted, neutralized = neutralize_reply_codes(redacted)
     return SanitizeResult(
         text=redacted,
         redactions=count,
         non_ascii_replaced=non_ascii,
         transliterated=translit,
+        neutralized=neutralized,
     )
 
 
-def sanitize_pager_text(text: str) -> str:
-    """Return ASCII text with emails, IPv4/IPv6, bearer tokens and secrets removed."""
-    return sanitize_with_report(text).text
+def sanitize_pager_text(text: str, *, neutralize_codes: bool = True) -> str:
+    """ASCII text with secrets, emails, IPs and bearer tokens removed and no reply-code lookalikes.
+
+    ``neutralize_codes=False`` keeps names such as ``db-1`` intact (used only to test whether a
+    name survives redaction).
+    """
+    return sanitize_with_report(text, neutralize_codes=neutralize_codes).text
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +516,7 @@ class PagerPayload(BaseModel):
 
 
 TITLE_MAX_SEPTETS: Final[int] = 16
+_OPTION_LETTERS: Final[str] = "AB"
 _TITLE_CAPS: Final[tuple[int, ...]] = (TITLE_MAX_SEPTETS, 12, 8, 4)
 _MIN_SUMMARY_SEPTETS: Final[int] = 12
 
@@ -381,7 +540,7 @@ def short_title(
     caps it at ``limit`` septets. Falls back to ``Option <n>`` when ``raw`` is
     missing or empty after sanitisation.
     """
-    fallback = f"Option {option}"
+    fallback = f"Option {_OPTION_LETTERS[(option - 1) % 2]}"  # not "Option 1": "on 1" is a reply lookalike
     if raw is None:
         return _shorten_title(fallback, limit)
     report = sanitize_with_report(raw)
@@ -392,10 +551,35 @@ def short_title(
             _reasons.add(ClampReason.NON_ASCII)
         if report.transliterated:
             _reasons.add(ClampReason.TRANSLITERATED)
+        if report.neutralized:
+            _reasons.add(ClampReason.CODE_NEUTRALIZED)
     text = _shorten_title(report.text, limit)
     if not text.strip("?*. -"):
         text = fallback
     return _shorten_title(text, limit) or fallback[:limit]
+
+
+MAX_PAGE_OPTIONS: Final[int] = 2
+NO_ACTION_TEXT: Final[str] = "No approved action. Manual response needed."
+
+
+def _option_suffix(token: str, titles: Sequence[str | None], cap: int, reasons: set[ClampReason]) -> str:
+    """Page tail: ``. <TOKEN>-1:<t1> <TOKEN>-2:<t2>`` per option, or the no-action notice.
+
+    ``short_title`` sanitises each title, including reply-code neutralisation, before the real
+    ``<TOKEN>-N:`` entry is put in front of it.
+    """
+    if not titles:
+        return f". {NO_ACTION_TEXT}"
+    # A title ending in two alphanumerics, a space and a token that starts with 1 or 2 would read as
+    # a reply (``11 1`` in ``...:11 10-2``). Only then is ``,`` used between the options instead.
+    parts = [f"{token}-{n}:{short_title(raw, n, cap, _reasons=reasons)}" for n, raw in enumerate(titles, 1)]
+    options = parts[0]
+    for part in parts[1:]:
+        tail = options[-2:]
+        joins_badly = token[0] in "12" and len(tail) == 2 and tail.isalnum() and tail.isascii()
+        options += ("," if joins_badly else " ") + part
+    return f". {options}"
 
 
 def format_pager_payload(
@@ -404,14 +588,22 @@ def format_pager_payload(
     summary: str,
     title1: str | None = None,
     title2: str | None = None,
+    *,
+    option_titles: Sequence[str | None] | None = None,
 ) -> PagerPayload:
     """Build ``INC-<TOKEN> <service>: <summary>. <TOKEN>-1:<t1> <TOKEN>-2:<t2>``.
 
-    ``title1``/``title2`` are the runbook titles for options 1 and 2 (generic
-    ``Option n`` when missing). The result is pure ASCII, at most 160 GSM-7
+    The number of reply options is explicit. With ``option_titles`` there is one
+    ``<TOKEN>-N:<title>`` option per entry (at most 2; extra entries are ignored)
+    and an empty sequence means no approved action: the page then ends with
+    ``No approved action. Manual response needed.`` and carries no reply code
+    (Req 3.4-3.6). Without ``option_titles`` the legacy two-option form is built
+    from ``title1``/``title2`` (generic ``Option A``/``Option B`` when missing).
+
+    The result is pure ASCII, at most 160 GSM-7
     septets, and free of emails, IP addresses, bearer tokens and high-entropy
-    secrets. The summary is truncated first, then the titles shrink; neither
-    reply code is ever dropped. ``clamped`` is true when the summary/service had
+    secrets. The summary is truncated first, then the titles shrink; no
+    offered reply code is ever dropped. ``clamped`` is true when the summary/service had
     to be redacted, ASCII-folded or truncated (title shortening alone is by
     design and does not count), so the caller can record a ``GUARDRAIL_CLAMPED``
     audit event (Req 3.3).
@@ -430,26 +622,32 @@ def format_pager_payload(
             reasons.add(ClampReason.NON_ASCII)
         if report.transliterated:
             reasons.add(ClampReason.TRANSLITERATED)
+        if report.neutralized:
+            reasons.add(ClampReason.CODE_NEUTRALIZED)
         return report.text
 
     service = _clean(service_name)
+    if _LEADING_DIGIT_RE.match(service):
+        # ``INC-AB 1: ...`` would read as the reply ``AB 1``.
+        service = f"#{service}"
     if len(service) > _MAX_SERVICE_CHARS or gsm7_septets(service) > _MAX_SERVICE_CHARS:
         service = clamp_to_septets(service[:_MAX_SERVICE_CHARS], _MAX_SERVICE_CHARS)
         reasons.add(ClampReason.TRUNCATED)
     service = service.rstrip(":. ") or "unknown"
     # The ": " separator can complete a match (e.g. "0@" + ":" -> "0@:"); redact with it.
-    contextual, count = _redact(f"{service}: ")
+    contextual, count = _redact(f"{service}: ", kv=False)
     if count:
         reasons.add(ClampReason.REDACTED)
         service = contextual.rstrip(":. ") or "unknown"
 
+    raw_titles: list[str | None] = (
+        [title1, title2] if option_titles is None else list(option_titles[:MAX_PAGE_OPTIONS])
+    )
     prefix = f"INC-{token} {service}: "
     suffix = ""
     budget = 0
     for cap in _TITLE_CAPS:
-        t1 = short_title(title1, 1, cap, _reasons=reasons)
-        t2 = short_title(title2, 2, cap, _reasons=reasons)
-        suffix = f". {token}-1:{t1} {token}-2:{t2}"
+        suffix = _option_suffix(token, raw_titles, cap, reasons)
         budget = PAGER_MAX_CHARS - gsm7_septets(prefix) - gsm7_septets(suffix)
         if budget >= _MIN_SUMMARY_SEPTETS:
             break
@@ -477,7 +675,12 @@ def format_pager_payload(
     if gsm7_septets(text) > PAGER_MAX_CHARS or not text.isascii() or _redact(text)[1] > 0:
         # Last-resort deterministic fallback; cannot violate the invariant.
         reasons.add(ClampReason.TRUNCATED)
-        text = f"INC-{token} Reply {token}-1 or {token}-2"
+        if not raw_titles:
+            text = f"INC-{token} {NO_ACTION_TEXT}"
+        elif len(raw_titles) == 1:
+            text = f"INC-{token} Reply: {token}-1"
+        else:
+            text = f"INC-{token} Reply: {token}-1, {token}-2"
 
     return PagerPayload(
         text=text,
@@ -490,7 +693,42 @@ def format_pager_payload(
 # SMS reply parsing (Req 4.4)
 # ---------------------------------------------------------------------------
 
-_SMS_REPLY_RE: Final[re.Pattern[str]] = re.compile(r"([A-Za-z0-9]{2})-([12])", re.ASCII)
+_SMS_REPLY_RE: Final[re.Pattern[str]] = re.compile(r"([A-Za-z0-9]{2})[- ]([12])", re.ASCII)
+_REPLY_TRAILING_RE: Final[re.Pattern[str]] = re.compile(r"[\s.!]+\Z")
+#: Dash variants (U+2010..U+2015, U+2212) folded to ``-``. NFKC leaves them untouched.
+_REPLY_DASHES: Final[Mapping[int, str]] = {
+    **{cp: "-" for cp in range(0x2010, 0x2016)},
+    0x2212: "-",
+}
+_FULLWIDTH_FIRST: Final[int] = 0xFF01
+_FULLWIDTH_LAST: Final[int] = 0xFF5E
+
+
+def _reply_char_allowed(ch: str) -> bool:
+    """Only ASCII, full-width forms (U+FF01..U+FF5E), the dash set and whitespace may enter NFKC.
+
+    NFKC also folds characters such as superscript digits or the Kelvin sign into
+    ASCII letters and digits; those must not be accepted as ``<TOKEN>-<N>``.
+    """
+    code = ord(ch)
+    return (
+        code < 0x80
+        or _FULLWIDTH_FIRST <= code <= _FULLWIDTH_LAST
+        or code in _REPLY_DASHES
+        or ch.isspace()
+    )
+
+
+def normalize_sms_reply(body: str) -> str | None:
+    """Canonical form of a reply body, or ``None`` when it holds a disallowed character.
+
+    NFKC, dash variants to ``-``, then leading whitespace and trailing ``.``, ``!`` and
+    whitespace are dropped.
+    """
+    if not all(_reply_char_allowed(ch) for ch in body):
+        return None
+    text = unicodedata.normalize("NFKC", body).translate(_REPLY_DASHES)
+    return _REPLY_TRAILING_RE.sub("", text.lstrip())
 
 
 class SmsReply(BaseModel):
@@ -507,14 +745,17 @@ class SmsReply(BaseModel):
 
 
 def parse_sms_reply(body: str, known_tokens: Collection[str] | None = None) -> SmsReply | None:
-    """Parse an SMS body; return ``None`` unless it is exactly ``<TOKEN>-1|2``.
+    """Parse an SMS body; return ``None`` unless it normalises to exactly ``<TOKEN>-1|2``.
 
-    Case and surrounding whitespace are tolerated; the token is normalised to
+    The body is normalised first (:func:`normalize_sms_reply`: NFKC, dash variants,
+    trailing ``.``/``!``/whitespace); a single space may replace the dash. Any other
+    leading or trailing text is rejected. The token is normalised to
     uppercase. When ``known_tokens`` is given, the token must be in it
     (compared case-insensitively). With ``None`` only the format is checked,
     so the caller can still answer "incident no longer active" (Req 4.5).
     """
-    match = _SMS_REPLY_RE.fullmatch(body.strip())
+    normalized = normalize_sms_reply(body)
+    match = None if normalized is None else _SMS_REPLY_RE.fullmatch(normalized)
     if match is None:
         return None
     token = match.group(1).upper()

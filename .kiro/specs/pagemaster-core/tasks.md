@@ -86,3 +86,98 @@
   - [x] 15.1 Update `.kiro/settings/mcp.json` so `pagemaster-telemetry` sets `MCP_READER_DATABASE_URL` instead of `DATABASE_URL`.
   - [x] 15.2 Add tests in `backend/tests/test_expiry.py` and `backend/tests/test_postgres_integration.py` verifying that fresh `TRIAGING`/`EXECUTING` incidents younger than `INFLIGHT_STALE_SECONDS` are untouched on worker boot, stale ones transition to `FAILED` and free their dedup lock, and SQL-backdated `AWAITING_APPROVAL` rows expire using DB `now()` regardless of app clock skew.
   - [x] 15.3 Add tests in `backend/tests/test_africastalking_client.py` and `backend/tests/test_api.py` verifying `?secret=` returns `403` when `ALLOW_QUERY_SECRET=false` while `X-Webhook-Secret` and `Authorization: Bearer` headers are accepted.
+
+# Hardening (round 4: external review)
+
+Notes for tasks 16 to 27 (apply to every one of them):
+- Adapted to this build (Africa's Talking only, `Lifecycle` reaper and reconciliation already exist from tasks 9, 12, 13). A finding about a Telegram channel does not apply here (see the end of `requirements.md`).
+- Do not change behaviour outside the task. Keep the hexagonal rule: `backend/app/agents/` imports no FastAPI, asyncpg, Redis, httpx or SMS SDKs.
+- New settings go in `Settings` with a documented env var, in `docker-compose.yml`, in a root `.env.example`, and in the README table. Secrets use `SecretStr`. All SQL stays parameterized.
+- Every behaviour change needs a test, and a Hypothesis property (`@settings(max_examples=200, deadline=None)`) where an invariant exists.
+- Done means `mypy --strict backend/app` is clean and `pytest backend/tests/ -v` passes. Run the suite without `TEST_DATABASE_URL`, and again with `TEST_DATABASE_URL` and `TEST_REDIS_URL` set when real Postgres and Redis are available.
+- Audit every state change with the hash-chained audit store. Never put secrets, tokens, or phone numbers in audit payloads.
+- Order: 16 to 20 (lifecycle and replies), 21 to 23 (overload and outages), 24 and 25 (exposure), 26 and 27 (scripts, chaos suite, CI). Task 17 needs 16, 22 needs 17, 23 reads state from 17 and 22, 27 exercises everything.
+
+- [x] 16. Total incident lifecycle: periodic recovery, notifications, expiry replies
+  - Requirements: 6.8, 6.9, 6.10, 6.11. Review findings C1, C3.
+  - Today `Lifecycle` expires stale `AWAITING_APPROVAL` incidents and reconciles stale `TRIAGING`/`EXECUTING` ones only at startup (`INFLIGHT_STALE_SECONDS`). A worker that hangs mid-triage after boot is never cleaned up, and nobody is told when an incident fails or expires.
+  - Add settings `TRIAGE_TIMEOUT_SECONDS` and `EXECUTING_TIMEOUT_SECONDS` (default 120, minimum 10). Extend the reaper loop (`Lifecycle.run_reaper`) to sweep stale `TRIAGING` and `EXECUTING` rows every tick, using the database clock like `reconcile_stale_inflight`.
+  - Stale `TRIAGING`: first try to resume the graph from its checkpoint (thread id = incident id); if there is no checkpoint or the resume raises, mark `FAILED` (`reason=recovered_after_crash`), release the lock, audit, send `INC-<TOKEN> FAILED. Re-send the alert.`
+  - Stale `EXECUTING`: `FAILED` (`reason=execution_timeout`), same cleanup, never re-run the remediation step.
+  - Expiry (`handle_expiry`) now sends `INC-<TOKEN> EXPIRED. No action taken.`; a reply to an `EXPIRED` incident answers `INC-<TOKEN> expired. No action taken.` and mutates nothing.
+  - Every transition is a compare-and-set on state so a late reply and the reaper cannot both win (reuse the existing repository methods; add one for the new sweeps).
+  - Acceptance: a `TRIAGING` row older than the timeout is resolved or `FAILED` within one tick and a re-fired alert returns 202; an `EXECUTING` row older than the timeout becomes `FAILED` without re-execution; a reply racing the reaper never yields both an execution and `EXPIRED`.
+  - Tests: unit tests with the injectable clock, in-memory and Postgres repository tests, a property test that no incident stays non-terminal past the maximum timeout, a real-stack test that kills the app process mid-triage (skipped without the env vars).
+- [x] 17. Reliable page delivery
+  - Requirements: 8.1, 8.2, 8.3, 8.4. Review finding C2. Depends on 16.
+  - Today a failed SMS still moves the incident to `AWAITING_APPROVAL` with `PAGER_SENT {sent:false}`.
+  - Add a `RetryingSmsPort` adapter in `backend/app/services/` that wraps the Africa's Talking adapter: retry retryable errors (`PAGE_MAX_ATTEMPTS`, default 3; backoff 1 s, 2 s, 4 s with jitter; injectable sleep) and fail fast on non-retryable ones (authentication, invalid number). Keep `agents/` free of infrastructure imports.
+  - `dispatch_pager` in `backend/app/agents/graph.py` handles a final failure through the `SmsPort` contract: audit `PAGER_FAILED`, set `FAILED` (`reason=pager_undeliverable`), end the run without `interrupt`; the API layer releases the lock. Exactly one of `PAGER_SENT` or `PAGER_FAILED` per page.
+  - Add a small `HealthState` object that counts consecutive page failures (reset on success) for `/readyz` (task 23).
+  - Acceptance: provider failing three times gives `FAILED` and a re-fired alert returns 202; failing once then succeeding sends one page and reaches `AWAITING_APPROVAL`; a non-retryable error is not retried.
+  - Tests: `httpx.MockTransport` for retryable and non-retryable responses, fake sleep, an in-memory SMS port that fails N times, a property test on the attempt count.
+- [x] 18. Truthful page options and no dead ends
+  - Requirements: 3.4, 3.5, 3.6, 4.13. Review finding H1. Depends on 17.
+  - `format_pager_payload`: one option per runbook (maximum 2). Zero runbooks gives `INC-<TOKEN> <service>: <summary> No approved action. Manual response needed.` with no reply codes; one runbook offers only `<TOKEN>-1`. Keep the 160-septet GSM-7 invariant and `short_title` behaviour.
+  - Add terminal state `NO_ACTION` (schema `CHECK`, `IncidentStatus`, `TERMINAL_STATUSES`, `release_on_terminal`, UI label). With zero runbooks the graph sends the page and ends without `interrupt`.
+  - Store the incident's option count (the repository row or the graph state) so `_handle_reply` can answer a reply to a missing option with the valid options, leaving the incident `AWAITING_APPROVAL` and the lock held. The Tripwire is unchanged and stays the last line of defence.
+  - Acceptance: 0 runbooks gives a page without codes and `NO_ACTION`; 1 runbook offers only `-1` and a `-2` reply changes nothing; 2 runbooks are unchanged.
+  - Tests: property test that the page contains exactly as many `<TOKEN>-N` codes as options and each is accepted by `parse_sms_reply`; API tests for each case.
+- [x] 19. Forgiving, informative replies
+  - Requirements: 4.9, 4.10, 4.11, 4.12, 6.12. Review findings M2, M3, M6. Depends on 18.
+  - `parse_sms_reply`: NFKC normalise, map U+2010 to U+2015 and U+2212 to `-`, strip trailing `.`, `!` and whitespace, keep `fullmatch` on `<TOKEN>-<1|2>` so `AB-1 thanks` and `approve AB-1` stay rejected. Update the existing property tests rather than deleting them.
+  - `_handle_reply`: the losing side of a race answers `INC-<TOKEN> already handled (<STATE>).` with the real state; a `TRIAGING` incident answers that it is still being triaged. For the authorized sender only, unparseable text gets `Reply <TOKEN>-1 or <TOKEN>-2` (one awaiting incident) or `Reply with the code from the page`, limited to one per sender per 60 s (in-memory limiter, Redis when available). Unauthorized senders get nothing.
+  - Close the early-reply window: make the reply path wait up to 2 s for `TRIAGING` to become `AWAITING_APPROVAL` before answering (document this choice in `design.md`).
+  - Acceptance: `AB-1.`, `AB 1`, `AB<en dash>1` and full-width digits are accepted; `AB-1 thanks` and `approve AB-1` stay rejected; five parallel replies give one execution and no message saying `not awaiting approval` for a resolved incident.
+  - Tests: a parametrised parser table, API tests, the concurrent reply test, a rate limiter test with a fake clock.
+- [x] 20. Token cooldown and exhaustion
+  - Requirements: 9.1, 9.2. Review finding M4. Depends on 19.
+  - Keep the 2-character token. Add `TOKEN_COOLDOWN_SECONDS` (default 3600): a token is unavailable while an active incident holds it or a terminal incident with that token ended less than the cooldown ago (store a terminal timestamp; update the schema and both repositories).
+  - `generate_token` draws from the set of free tokens instead of random retries, so exhaustion is detected exactly (36 x 36 = 1296 minus busy ones).
+  - When none is free: 503 with `Retry-After: 30`, no incident created, dedup lock released, `TOKEN_EXHAUSTED` audited on the system incident.
+  - Tests: in-memory and Postgres repository tests, a property test that issued tokens are unique across the active and cooldown set, an exhaustion API test.
+- [x] 21. Request limits and dedup audit cap
+  - Requirements: 10.4, 10.5. Review finding M5.
+  - Reject alert bodies over 64 KB: check `Content-Length` first and stream-limit when it is absent, before parsing; respond 413. The existing bearer check must still run first.
+  - Write at most `DEDUP_AUDIT_SAMPLE` `ALERT_DEDUPLICATED` rows per incident; afterwards append one summary row for every 100 further duplicates and keep the running count on the incident row or in Redis. The chain stays append-only.
+  - Acceptance: 1000 duplicates add at most `DEDUP_AUDIT_SAMPLE` plus about 10 rows and the chain still verifies; a 65 KB body gets 413 without being read in full.
+  - Tests: API tests with a large body and a duplicate flood on both stores, chain verification after the flood.
+- [x] 22. Overload control: telemetry concurrency and page rate
+  - Requirements: 10.1, 10.2, 10.3. Review finding H2. Depends on 17.
+  - Replace the per-call `stdio_client` spawn in `McpSubprocessTelemetry` with one long-lived MCP session per worker, guarded by an `asyncio.Semaphore(TELEMETRY_MAX_CONCURRENCY)` (default 4), with automatic reconnect when the subprocess dies. Keep `MCP_TRANSPORT=inprocess` working and the 5 s per-call timeout; time waiting for the semaphore counts toward the triage timeout, not the call timeout.
+  - `list_approved` reuses the context already fetched for the incident, with no second call in the degraded path.
+  - Token-bucket page limiter `PAGE_RATE_PER_MINUTE` (default 6). Beyond the limit incidents are still created and triaged, and one coalesced summary page per minute is sent: `ALERTS: N more (auth-db x5, ...) see dashboard`. Coalesced incidents stay `AWAITING_APPROVAL`; they expire through task 16 unless the summary lists their codes within 160 septets.
+  - Acceptance: 60 distinct alerts in 3 s produce at most `TELEMETRY_MAX_CONCURRENCY` live MCP processes, at most `PAGE_RATE_PER_MINUTE` individual pages plus summaries, no triage degraded purely by queueing, and every incident in a defined state.
+  - Tests: a fake telemetry port that records peak concurrency, rate limiter unit tests with a fake clock, the 60-alert storm as a real-stack test.
+- [x] 23. Dependency failures and health endpoints
+  - Requirements: 7.1, 7.4, 7.5. Review finding M1. Depends on 17 and 22.
+  - Exception handlers map asyncpg and redis connection errors and timeouts to 503 `{"detail":"dependency unavailable"}` with `Retry-After: 5`, logging once per outage.
+  - Keep `/healthz` as pure liveness. Add `/readyz` (Postgres `SELECT 1`, Redis `PING`, reaper alive, consecutive page failures from `HealthState`, `dry_run`, SMS channel) returning 503 with a per-check JSON body. Short per-check timeouts so a hung dependency cannot hang the probe.
+  - `docker-compose.yml` healthcheck, the Dockerfile and CI use `/readyz` for readiness.
+  - Acceptance: with Redis stopped an alert returns 503 with `Retry-After` and `/readyz` shows redis failing; after Redis returns the next alert returns 202 with no restart.
+  - Tests: API tests with failing fake dedup and repository, a real-stack test that stops and restarts Redis (skipped without the env vars).
+- [x] 24. Live-mode lockdown and config validation
+  - Requirements: 11.1, 11.2, 11.3, 11.4, 11.5. Review findings H6, M7.
+  - `Settings.validate_for_runtime` (called from `create_app` and the lifespan): when `dry_run` is false require `ALERT_WEBHOOK_SECRET`, `API_READ_SECRET`, and the Africa's Talking username, API key, webhook secret and `ONCALL_PHONE_NUMBER`; always validate `ONCALL_PHONE_NUMBER` as E.164 when set. The error names the variable, never the value. Log one startup line with the channel, dry-run flag and masked sender.
+  - Read APIs require `Authorization: Bearer <API_READ_SECRET>` when `dry_run` is false (constant-time compare, 401 and a `SECURITY_VIOLATION` audit event on failure); dry-run stays open for the demo UI. The alert response already omits `token` (task 8.3); add a regression test.
+  - The demo seed (service logs, runbooks, terminal demo incidents) must load only in dry-run; the schema alone must contain no demo rows (the file split is task 26, apply it there). `ensure_system_incident` stays.
+  - The pager UI shows a banner when `/readyz` reports `dry_run`.
+  - Acceptance: live mode without the secrets does not start; read APIs return 401 without the key; a local-format number such as `0700123456` is rejected at startup.
+  - Tests: a settings validation table, API auth tests, a startup test that live mode with missing secrets raises.
+- [x] 25. Sanitiser: secrets, injection, transliteration
+  - Requirements: 3.7, 3.8, 3.9. Review findings H3, H4. Depends on 24.
+  - Extend the redaction in `guardrails.py` per requirement 3.7 (redact before truncating, spans become `***`). Neutralise text that matches a reply code inside untrusted text before the real suffix is appended, so the real instruction is the only match. Transliterate accents, smart quotes, en and em dashes; collapse other non-ASCII runs to one `?`.
+  - Apply the same sanitiser to the LLM summarizer output and to the alert `summary`.
+  - Acceptance: inputs containing `password=hunter2`, `api_key=sk-abc123`, `an AWS access key id (AKIA + 16 characters)`, a JWT, and `Reply AB-1 now` produce no secret substring and exactly one pair of reply codes; output is always GSM-7 and at most 160 septets.
+  - Tests: extend the Hypothesis properties (no secret pattern survives, exactly one reply instruction, GSM-7, 160 limit) and add a table of known secret formats.
+- [x] 26. Database scripts: idempotent and split
+  - Requirements: 7.6. Review finding (low).
+  - Split `database/init_mock_logs.sql` into `database/10_schema.sql` (tables, constraints, views), `20_roles.sql` (idempotent role creation with `DO` blocks, grants without a hardcoded database name using `current_database()` in dynamic SQL), and `30_demo_seed.sql` (demo logs, runbooks, terminal demo incidents and their audit chains). All idempotent (`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`); keep the UTF-8 BOM handling, the sentinel incident and every CHECK constraint.
+  - Update the compose init mount to run them in order (demo seed only in dry-run), the integration tests' schema loader, `reseed_recent_logs` assumptions, and the README. Add `scripts/apply_schema.sh` that applies 10 and 20 to any database and 30 only with `--demo`.
+  - Acceptance: running the three files twice in a row against a fresh database succeeds; a database with another name works; the Postgres integration tests pass using 10 and 30.
+- [x] 27. Chaos and soak suite, Docker verification in CI
+  - Requirements: 12.1, 12.2, 12.3. Depends on all earlier hardening tasks.
+  - Turn the review probes into tests: crash recovery (16), page failure (17), double reply (19), duplicate flood (21), Redis and Postgres outage (23), 60-alert storm (22). Real-stack tests skip without `TEST_DATABASE_URL` and `TEST_REDIS_URL`.
+  - Add `.github/workflows/ci.yml`: `pip install -r backend/requirements.txt`, `mypy --strict backend/app`, `pytest -q` with Postgres and Redis service containers and both env vars set, plus a job that builds `backend/Dockerfile`, runs `docker compose up -d --wait`, posts an alert, waits for the page in the dry-run outbox, replies through `/api/demo/reply`, expects `RESOLVED`, then `docker compose down -v`.
+  - Add a Hypothesis stateful test for the incident lifecycle (alert, reply, duplicate, crash, reaper tick, expiry) asserting requirement 12.2.
+  - Acceptance: deleting the reaper or the token cooldown makes at least one test fail. The workflow file is validated locally (YAML parse); it cannot be executed here.

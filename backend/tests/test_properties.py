@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import re
+import unicodedata
 from typing import Any
 from uuid import UUID
 
@@ -176,12 +177,28 @@ def test_property_3_valid_replies_accepted(case: tuple[str, str, str]) -> None:
 
 
 def _oracle(body: str, known: list[str]) -> bool:
-    s = body.strip()
+    """Independent model of the Req 4.9 normalisation, written char by char."""
+    chars: list[str] = []
+    for ch in body:
+        code = ord(ch)
+        if ch.isspace():
+            chars.append(" " if unicodedata.normalize("NFKC", ch) == " " else ch)
+        elif code < 0x80:
+            chars.append(ch)
+        elif 0xFF01 <= code <= 0xFF5E:  # full-width forms
+            chars.append(chr(code - 0xFEE0))
+        elif 0x2010 <= code <= 0x2015 or code == 0x2212:
+            chars.append("-")
+        else:
+            return False
+    s = "".join(chars).strip()
+    while s and (s[-1] in ".!" or s[-1].isspace()):
+        s = s[:-1]
     return (
         len(s) == 4
         and s[:2].isascii()
         and s[:2].isalnum()
-        and s[2] == "-"
+        and s[2] in "- "
         and s[3] in ("1", "2")
         and s[:2].upper() in known
     )
@@ -189,10 +206,15 @@ def _oracle(body: str, known: list[str]) -> bool:
 
 _near_misses = st.one_of(
     st.text(max_size=12),
-    st.from_regex(r"[A-Za-z0-9]{0,3}[-\u2013 ]?[0-9]{0,2}", fullmatch=True),
-    st.sampled_from(["7A-3", "7A-0", "7A-11", "7A 1", "7A1", "7A-", "-1", "ZZ-1", "7A-1 yes", "yes 7A-1", "7A\u20131"]),
+    st.from_regex(r"[A-Za-z0-9]{0,3}[-\u2013\u2212 ]?[0-9]{0,2}", fullmatch=True),
+    st.from_regex(r"[ \t]{0,2}(7A|b3|\uff17\uff21)[-\u2010-\u2015\u2212\uff0d ][12\uff11\uff12\u00b9][.!\s]{0,3}", fullmatch=True),
+    st.sampled_from(
+        [
+            "7A-3", "7A-0", "7A-11", "7A 1", "7A1", "7A-", "-1", "ZZ-1", "7A-1 yes", "yes 7A-1",
+            "7A\u20131", "7A-1.", "7A-\u00b9", "\u212aA-1", "K9-1\u2026", "7A  1", "7A\t1", "7A-1?",
+        ]
+    ),
 )
-
 
 @settings(max_examples=200, deadline=None)
 @given(body=_near_misses)
@@ -323,7 +345,7 @@ def test_property_5_deletion_detected(
 
 _AUDIT_INCIDENT = UUID("00000000-0000-4000-8000-0000000000a4")
 # Computed with hashlib over the exact string produced by the SQL in
-# database/init_mock_logs.sql: prev_hash || '|' || incident_id::text || '|' || seq
+# database/30_demo_seed.sql: prev_hash || '|' || incident_id::text || '|' || seq
 # || '|' || event_type || '|' || payload::text  (jsonb::text uses ': ' and ', ').
 _VECTOR_HASH_0 = "b01ddcc639880486d43ad53f034c557e039dacbb617dcc24577e6dcf25604b7a"
 _VECTOR_HASH_1 = "3ab7cd754cf7f36a18b598e4294f865c2371c47f39170ee738e9d78922cf7d08"
@@ -388,7 +410,7 @@ _non_ip_colon_ids = st.one_of(
 @given(ident=_non_ip_colon_ids)
 def test_property_1_timestamps_and_mac_like_ids_survive(ident: str) -> None:
     """**Validates: Requirements 3.2, 3.3**"""
-    assert sanitize_pager_text(f"at {ident} err") == f"at {ident} err"
+    assert sanitize_pager_text(f"at {ident} err", neutralize_codes=False) == f"at {ident} err"
 
 
 @settings(max_examples=200, deadline=None)
@@ -523,7 +545,7 @@ def test_property_7_single_sms_septet_budget(
             assert tail[:1] not in ("", " ")
     else:
         # Documented last-resort fallback: both reply codes survive.
-        assert text == f"INC-{token} Reply {token}-1 or {token}-2"
+        assert text == f"INC-{token} Reply: {token}-1, {token}-2"
 
 
 @settings(max_examples=200, deadline=None)
@@ -537,7 +559,9 @@ def test_property_7_single_sms_septet_budget(
 def test_property_7_short_titles_appear_verbatim(token: str, service: str, summary: str, t1: str, t2: str) -> None:
     """**Validates: Requirements 3.1, 3.2**"""
     text = format_pager_payload(token, service, summary, t1, t2).text
-    assert text.endswith(f". {token}-1:{t1} {token}-2:{t2}")
+    # A "," joins the options when t1 ends in two alphanumerics and the token starts with 1 or 2.
+    sep = "," if token[0] in "12" and t1[-2:].isalnum() and len(t1[-2:]) == 2 else " "
+    assert text.endswith(f". {token}-1:{t1}{sep}{token}-2:{t2}")
 
 
 @settings(max_examples=200, deadline=None)
@@ -937,3 +961,531 @@ def test_property_12_route_accepts_only_when_selected_source_matches(
             assert resp.status_code == 200 and after.state == "RESOLVED"
         else:
             assert resp.status_code == 403 and after.state == "AWAITING_APPROVAL"
+
+
+# ---------------------------------------------------------------------------
+# Property 13: no incident stays non-terminal beyond the maximum timeout (Req 6.8, 6.11)
+# ---------------------------------------------------------------------------
+_P13_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    rows=st.lists(
+        st.tuples(
+            st.sampled_from(["TRIAGING", "EXECUTING", "AWAITING_APPROVAL"]),
+            st.integers(min_value=0, max_value=5000),
+        ),
+        min_size=0,
+        max_size=15,
+    ),
+    triage_t=st.integers(min_value=10, max_value=1000),
+    exec_t=st.integers(min_value=10, max_value=1000),
+    ttl=st.integers(min_value=10, max_value=1000),
+)
+def test_property_13_no_incident_stays_non_terminal_past_timeout(
+    rows: list[tuple[str, int]], triage_t: int, exec_t: int, ttl: int
+) -> None:
+    """**Validates: Requirements 6.8, 6.11**"""
+    from uuid import uuid4
+
+    from backend.app.services.dedup import InMemoryDedupStore
+    from backend.app.services.incident_store import InMemoryAuditStore, TERMINAL_STATUSES
+    from backend.app.services.lifecycle import Lifecycle
+    from backend.tests.test_expiry import Clock
+
+    class _Sms:
+        async def send(self, text: str) -> None:
+            return None
+
+    async def scenario() -> None:
+        clock = Clock()
+        repo = InMemoryIncidentRepository(clock)
+        base = clock.now
+        ids: list[tuple[UUID, str, int]] = []
+        for i, (state, age) in enumerate(rows):
+            clock.now = base - timedelta(seconds=age)
+            iid = uuid4()
+            await repo.create(
+                incident_id=iid, token=f"{_P13_ALPHABET[i]}1", service_name="svc", error_code=f"E{i}", raw_alert={}
+            )
+            await repo.set_state(iid, state)  # type: ignore[arg-type]
+            ids.append((iid, state, age))
+        clock.now = base
+        lifecycle = Lifecycle(
+            incidents=repo,
+            audit=InMemoryAuditStore(repo),
+            dedup=InMemoryDedupStore(),
+            sms=_Sms(),
+            approval_ttl_seconds=ttl,
+            clock=clock,
+            triage_timeout_seconds=triage_t,
+            executing_timeout_seconds=exec_t,
+        )
+        await lifecycle.tick()
+        bound = {"TRIAGING": triage_t, "EXECUTING": exec_t, "AWAITING_APPROVAL": ttl}
+        for iid, state, age in ids:
+            row = await repo.get(iid)
+            assert row is not None
+            if age >= bound[state]:
+                assert row.state in TERMINAL_STATUSES
+            else:
+                assert row.state == state
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 14: page delivery attempts (Req 8.1, 8.2, 8.3)
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    failures=st.integers(min_value=0, max_value=10),
+    max_attempts=st.integers(min_value=1, max_value=6),
+    retryable=st.booleans(),
+)
+def test_property_14_page_attempt_count(failures: int, max_attempts: int, retryable: bool) -> None:
+    """**Validates: Requirements 8.1, 8.2**"""
+    from backend.app.services.africastalking_client import SmsSendError
+    from backend.app.services.retrying_sms import RetryingSmsPort
+
+    class _Inner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send(self, text: str) -> None:
+            self.calls += 1
+            if self.calls <= failures:
+                raise SmsSendError("x", retryable=retryable)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def scenario() -> tuple[int, bool]:
+        inner = _Inner()
+        port = RetryingSmsPort(inner, max_attempts=max_attempts, sleep=fake_sleep, rand=lambda: 0.5)
+        try:
+            await port.send("page")
+        except SmsSendError:
+            return inner.calls, False
+        return inner.calls, True
+
+    attempts, delivered = asyncio.run(scenario())
+    if failures == 0:
+        expected = 1
+    elif retryable:
+        expected = min(failures + 1, max_attempts)
+    else:
+        expected = 1
+    assert attempts == expected
+    assert len(sleeps) == (attempts - 1 if retryable else 0)
+    assert delivered == (failures == 0 or (retryable and failures < max_attempts))
+
+
+# ---------------------------------------------------------------------------
+# Property 15: the page offers exactly as many reply codes as options (Req 3.4, 3.5, 3.6)
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    count=st.integers(min_value=0, max_value=2),
+    token=st.from_regex(r"[A-Z0-9]{2}", fullmatch=True),
+    service=st.text(max_size=60),
+    summary=st.text(max_size=300),
+    titles=st.lists(st.text(max_size=40), min_size=2, max_size=2),
+)
+def test_property_15_page_has_exactly_as_many_codes_as_options(
+    count: int, token: str, service: str, summary: str, titles: list[str]
+) -> None:
+    """**Validates: Requirements 3.4, 3.5, 3.6**"""
+    from backend.app.services.guardrails import (
+        NO_ACTION_TEXT,
+        format_pager_payload,
+        gsm7_septets,
+        parse_sms_reply,
+    )
+
+    text = format_pager_payload(token, service, summary, option_titles=titles[:count]).text
+    assert text.isascii() and gsm7_septets(text) <= 160 and text.startswith(f"INC-{token}")
+    codes = re.findall(rf"(?<![A-Za-z0-9]){token}-(\d)(?![0-9])", text, re.IGNORECASE)
+    assert codes == [str(n) for n in range(1, count + 1)]
+    for n in range(1, count + 1):
+        reply = parse_sms_reply(f"{token}-{n}", known_tokens=[token])
+        assert reply is not None and reply.action_code == f"{token}-{n}"
+    if count == 0:
+        assert text.endswith(NO_ACTION_TEXT)
+
+
+# ---------------------------------------------------------------------------
+# Property 16: forgiving but exact reply parsing (Req 4.9)
+# ---------------------------------------------------------------------------
+
+_P16_ALPHABET = st.sampled_from(
+    list("aAzZ09-.! \t") + ["\u2010", "\u2013", "\u2015", "\u2212", "\uff11", "\uff21", "\u00b9", "\u212a", "\u00a0", "x_"]
+)
+
+
+@settings(max_examples=200, deadline=None)
+@given(body=st.lists(_P16_ALPHABET, max_size=10).map("".join))
+def test_property_16_accepted_text_normalises_to_canonical_code(body: str) -> None:
+    """**Validates: Requirements 4.9**"""
+    from backend.app.services.guardrails import normalize_sms_reply
+
+    reply = parse_sms_reply(body)
+    if reply is None:
+        return
+    assert re.fullmatch(r"[A-Z0-9]{2}-[12]", reply.action_code, re.ASCII)
+    normalized = normalize_sms_reply(body)
+    assert normalized is not None
+    assert re.fullmatch(r"[A-Za-z0-9]{2}[- ][12]", normalized, re.ASCII)
+    assert normalized[:2].upper() == reply.token and normalized[3] == reply.choice
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    token=st.from_regex(r"[A-Za-z0-9]{2}", fullmatch=True),
+    choice=st.sampled_from(["1", "2"]),
+    sep=st.sampled_from(["-", " ", "\u2013", "\u2212"]),
+    extra=st.from_regex(r"[A-Za-z0-9_]{1,4}", fullmatch=True),
+    where=st.sampled_from(["prefix", "suffix", "prefix_space", "suffix_space"]),
+)
+def test_property_16_extra_word_characters_are_rejected(
+    token: str, choice: str, sep: str, extra: str, where: str
+) -> None:
+    """**Validates: Requirements 4.9**"""
+    core = f"{token}{sep}{choice}"
+    assert parse_sms_reply(core) is not None  # the core alone is accepted
+    body = {
+        "prefix": f"{extra}{core}",
+        "suffix": f"{core}{extra}",
+        "prefix_space": f"{extra} {core}",
+        "suffix_space": f"{core} {extra}",
+    }[where]
+    assert parse_sms_reply(body) is None
+
+
+# ---------------------------------------------------------------------------
+# Property 17: issued tokens are unique among active and cooling-down tokens (Req 9.1, 9.2)
+# ---------------------------------------------------------------------------
+
+_P17_OPS = st.lists(
+    st.one_of(
+        st.tuples(st.just("create"), st.just(0)),
+        st.tuples(st.just("terminate"), st.integers(min_value=0, max_value=20)),
+        st.tuples(st.just("advance"), st.integers(min_value=0, max_value=40)),
+    ),
+    max_size=40,
+)
+
+
+@settings(max_examples=200, deadline=None)
+@given(ops=_P17_OPS, cooldown=st.integers(min_value=0, max_value=60))
+def test_property_17_issued_tokens_are_unique_among_active_and_cooling(
+    ops: list[tuple[str, int]], cooldown: int
+) -> None:
+    """**Validates: Requirements 9.1, 9.2**"""
+    from uuid import UUID, uuid4
+
+    from backend.app.services.incident_store import TokenExhaustedError, generate_token, token_space
+    from backend.tests.test_expiry import Clock
+
+    alphabet = "ABC"  # 9 tokens, so exhaustion is reachable
+    everything = set(token_space(alphabet))
+
+    async def scenario() -> None:
+        clock = Clock()
+        repo = InMemoryIncidentRepository(clock)
+        active: dict[UUID, str] = {}
+        cooling: list[tuple[str, datetime]] = []  # token, terminal time (independent model)
+        for n, (op, arg) in enumerate(ops):
+            if op == "advance":
+                clock.advance(arg)
+            elif op == "terminate" and active:
+                incident_id = sorted(active, key=str)[arg % len(active)]
+                await repo.set_state(incident_id, "RESOLVED")
+                cooling.append((active.pop(incident_id), clock.now))
+            elif op == "create":
+                expected_busy = set(active.values()) | {
+                    t for t, at in cooling if (clock.now - at).total_seconds() < cooldown
+                }
+                busy = await repo.busy_tokens(cooldown)
+                assert busy == expected_busy
+                try:
+                    token = generate_token(busy, alphabet)
+                except TokenExhaustedError:
+                    assert expected_busy == everything  # exact: no free token existed
+                    continue
+                assert token not in expected_busy
+                incident_id = uuid4()
+                await repo.create(
+                    incident_id=incident_id,
+                    token=token,
+                    service_name="svc",
+                    error_code=f"E{n}",
+                    raw_alert={},
+                )
+                active[incident_id] = token
+        assert len(set(active.values())) == len(active)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 18: bounded dedup audit growth (Req 10.5)
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=200, deadline=None)
+@given(duplicates=st.integers(min_value=0, max_value=700), sample=st.integers(min_value=1, max_value=40))
+def test_property_18_dedup_audit_rows_are_bounded_and_the_chain_verifies(
+    duplicates: int, sample: int
+) -> None:
+    """**Validates: Requirements 10.5**"""
+    from dataclasses import replace
+
+    from backend.app.api.routes import AlertPayload, _record_duplicate
+    from backend.tests.test_expiry import add_incident, make_services
+
+    async def scenario() -> None:
+        services, _, _ = make_services()
+        services = replace(services, dedup_audit_sample=sample)
+        incident = await add_incident(services, "AWAITING_APPROVAL")
+        payload = AlertPayload(service_name="svc", error_code="E1")
+        for _ in range(duplicates):
+            await _record_duplicate(services, incident.incident_id, payload)
+        chain = await services.audit.records(incident.incident_id)
+        dedup_rows = [r for r in chain if r.event_type.startswith("ALERT_DEDUPLICATED")]
+        assert len(dedup_rows) == min(duplicates, sample) + max(0, (duplicates - sample) // 100)
+        assert verify_chain(chain).valid
+        row = await services.incidents.get(incident.incident_id)
+        assert row is not None and row.duplicate_count == duplicates
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 19: page rate and coalescing (Req 10.3)
+# ---------------------------------------------------------------------------
+
+_page_ops = st.lists(
+    st.one_of(
+        st.tuples(st.just("req"), st.sampled_from(["auth-db", "payment-gateway", "x" * 40]), st.booleans()),
+        st.tuples(st.just("wait"), st.floats(min_value=0.0, max_value=45.0), st.just(False)),
+        st.tuples(st.just("flush"), st.just(""), st.just(False)),
+    ),
+    min_size=0,
+    max_size=120,
+)
+
+
+@settings(max_examples=200, deadline=None)
+@given(rate=st.integers(min_value=1, max_value=12), ops=_page_ops)
+def test_property_19_page_rate_window_and_exactly_once_coalescing(
+    rate: int, ops: list[tuple[str, Any, bool]]
+) -> None:
+    """**Validates: Requirements 10.3**"""
+    from backend.app.services.page_rate import CoalescingPageGate, PageRateLimiter
+    from backend.app.services.sms_common import validate_outbound
+
+    now = [0.0]
+
+    class Sms:
+        def __init__(self) -> None:
+            self.summaries: list[tuple[float, str]] = []
+
+        async def send(self, text: str) -> None:
+            self.summaries.append((now[0], validate_outbound(text)))  # pager invariant holds
+
+    async def scenario() -> None:
+        sms = Sms()
+        gate = CoalescingPageGate(sms, PageRateLimiter(rate, lambda: now[0]), clock=lambda: now[0])
+        sent_at: list[float] = []
+        requests = coalesced = 0
+        for kind, arg, flag in ops:
+            if kind == "wait":
+                now[0] += float(arg)
+            elif kind == "flush":
+                await gate.flush()
+            else:
+                requests += 1
+                decision = await gate.admit(token="AB", service_name=str(arg), actionable=flag)
+                assert decision in ("SEND", "COALESCED")
+                if decision == "SEND":
+                    sent_at.append(now[0])
+                else:
+                    coalesced += 1
+        # Never more than ``rate`` individual pages in any 60 s window.
+        for i, start in enumerate(sent_at):
+            assert sum(1 for t in sent_at[i:] if t < start + 60.0) <= rate
+        # Every request is decided exactly once.
+        assert len(sent_at) + coalesced == requests
+        # Coalesced incidents are either summarised once or still pending, never lost or doubled.
+        summarised = sum(int(re.match(r"ALERTS: (\d+) more", text).group(1)) for _, text in sms.summaries)  # type: ignore[union-attr]
+        assert summarised + gate.pending == coalesced
+        # At most one summary per minute, each within the septet budget.
+        times = [t for t, _ in sms.summaries]
+        assert all(b - a >= 60.0 for a, b in zip(times, times[1:], strict=False))
+        assert all(len(text) <= PAGER_MAX_CHARS for _, text in sms.summaries)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Property 20: Pager readiness threshold (task 23). Validates: Requirements 7.5
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=200, deadline=None)
+@given(failures=st.integers(0, 50), threshold=st.integers(1, 50))
+def test_property_20_pager_readiness_threshold(failures: int, threshold: int) -> None:
+    from backend.app.services.health_state import HealthState
+    from backend.app.services.readiness import ReaperHeartbeat, run_readiness
+
+    health = HealthState()
+    for _ in range(failures):
+        health.record_page_failure()
+    report = asyncio.run(
+        run_readiness(
+            ping_postgres=None,
+            ping_redis=None,
+            heartbeat=ReaperHeartbeat(),
+            health=health,
+            page_failure_threshold=threshold,
+            dry_run=False,
+            timeout=0.05,
+        )
+    )
+    assert report.checks.pager.ok is (failures < threshold)
+    assert (report.status == "ok") is (failures < threshold)
+
+
+# ---------------------------------------------------------------------------
+# Property 21: Live configuration validation (task 24). Validates: Requirements 11.1, 11.4
+# ---------------------------------------------------------------------------
+
+from backend.app.main import ConfigError as _ConfigError  # noqa: E402
+from backend.app.main import Settings as _LiveSettings  # noqa: E402
+
+_LIVE_NAMES = (
+    "ALERT_WEBHOOK_SECRET",
+    "API_READ_SECRET",
+    "AFRICASTALKING_USERNAME",
+    "AFRICASTALKING_API_KEY",
+    "AFRICASTALKING_WEBHOOK_SECRET",
+    "ONCALL_PHONE_NUMBER",
+)
+_LIVE_VALUES = {
+    "ALERT_WEBHOOK_SECRET": "zq-alert-7c1d",
+    "API_READ_SECRET": "zq-read-93ab",
+    "AFRICASTALKING_USERNAME": "zq-user-55ef",
+    "AFRICASTALKING_API_KEY": "zq-key-08cc",
+    "AFRICASTALKING_WEBHOOK_SECRET": "zq-hook-4d2a",
+}
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    present=st.fixed_dictionaries({n: st.booleans() for n in _LIVE_NAMES}),
+    number=st.sampled_from(["+254711000111", "+14155550100", "0700123456", "254711000111", "+0711", "abc"]),
+)
+def test_property_21_live_config_validation(present: dict[str, bool], number: str) -> None:
+    env = {"DRY_RUN": "false", "USE_IN_MEMORY": "true"}
+    for name in _LIVE_NAMES:
+        if present[name]:
+            env[name] = number if name == "ONCALL_PHONE_NUMBER" else _LIVE_VALUES[name]
+    cfg = _LiveSettings.from_env(env)
+    number_ok = present["ONCALL_PHONE_NUMBER"] and number in ("+254711000111", "+14155550100")
+    expect_ok = all(present.values()) and number_ok
+    try:
+        cfg.validate_for_runtime()
+    except _ConfigError as exc:
+        assert not expect_ok
+        text = str(exc)
+        assert all(v not in text for v in _LIVE_VALUES.values())
+        if present["ONCALL_PHONE_NUMBER"]:
+            assert number not in text
+        for name in _LIVE_NAMES:
+            if not present[name]:
+                assert name in text
+    else:
+        assert expect_ok
+
+
+# ---------------------------------------------------------------------------
+# Property 22: sanitiser. No secret survives; only the real reply codes parse (task 25).
+# Validates: Requirements 3.7, 3.8, 3.9
+# ---------------------------------------------------------------------------
+
+from backend.app.services.guardrails import format_pager_payload as _fmt22  # noqa: E402
+from backend.app.services.guardrails import gsm7_septets as _septets22  # noqa: E402
+from backend.app.services.guardrails import parse_sms_reply as _parse22  # noqa: E402
+
+_SECRET_FRAGMENTS_22: tuple[tuple[str, str], ...] = (
+    ("password=hunter2", "hunter2"),
+    ("api_key=sk-abc123", "abc123"),
+    ("AKIA" + "ABCDEFGHIJKLMNOP", "AKIA" + "ABCDEFGHIJKLMNOP"),
+    ("ghp_abcdefghij1234567890", "ghp_abcdefghij1234567890"),
+    ("xoxb-123-456-abcdefgh", "xoxb-123-456-abcdefgh"),
+    (
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+        "eyJhbGciOiJIUzI1NiJ9",
+    ),
+    ("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "9f86d081884c7d659a2feaa0"),
+)
+_NOISE_22 = st.text(
+    alphabet=st.sampled_from(list("abAB12 -_.:,\u2013\u2014\u2010\u00e9\u201c\u4e2d\uff0d\uff11")),
+    max_size=40,
+)
+
+
+@st.composite
+def _untrusted_22(draw: st.DrawFn) -> tuple[str, list[str]]:
+    pieces: list[str] = []
+    secrets: list[str] = []
+    for _ in range(draw(st.integers(1, 4))):
+        pieces.append(draw(_NOISE_22))
+        frag, needle = draw(st.sampled_from(_SECRET_FRAGMENTS_22))
+        if draw(st.booleans()):
+            pieces.append(frag)
+            secrets.append(needle)
+    pieces.append(draw(_NOISE_22))
+    return draw(st.sampled_from([" ", ""])).join(pieces), secrets
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    token=st.from_regex(r"[A-Z0-9]{2}", fullmatch=True),
+    service=_untrusted_22(),
+    summary=_untrusted_22(),
+    titles=st.lists(_untrusted_22(), max_size=2),
+)
+def test_property_22_sanitiser(
+    token: str,
+    service: tuple[str, list[str]],
+    summary: tuple[str, list[str]],
+    titles: list[tuple[str, list[str]]],
+) -> None:
+    """**Validates: Requirements 3.7, 3.8, 3.9**"""
+    page = _fmt22(
+        token, service[0], summary[0], option_titles=[t[0] for t in titles]
+    ).text
+    assert page.isascii()
+    assert _septets22(page) <= 160
+    for _, secrets in (service, summary, *titles):
+        for needle in secrets:
+            assert needle not in page
+    real = {f"{token}-{n}" for n in range(1, len(titles) + 1)}
+    # Windows that start inside the fixed ``INC-`` prefix (``NC-1`` for token ``10``) are not
+    # untrusted text and cannot be removed without changing the mandated prefix.
+    found = {
+        page[i:j].rstrip(" .!")
+        for i in range(len("INC-"), len(page))
+        for j in range(i + 1, min(len(page), i + 10) + 1)
+        if _parse22(page[i:j]) is not None and page[i] != " "
+    }
+    assert found == real

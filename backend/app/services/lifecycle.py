@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
@@ -26,13 +26,22 @@ from uuid import UUID
 
 from backend.app.agents.ports import SmsPort
 from backend.app.services.dedup import DedupStore, release_on_terminal
-from backend.app.services.incident_store import AuditStore, ExpiryOutcome, IncidentRepository
+from backend.app.services.incident_store import (
+    AuditStore,
+    ExpiryOutcome,
+    IncidentRepository,
+    ReclaimedIncident,
+)
 from backend.app.services.leader_lock import WORKER_ID, ReconcileLock
+from backend.app.services.readiness import ReaperHeartbeat
 
 logger = logging.getLogger("pagemaster.lifecycle")
 
 EVENT_INCIDENT_FAILED: Final[str] = "INCIDENT_FAILED"
 REASON_STALE: Final[str] = "stale_inflight_reconciled"
+REASON_RECOVERED_AFTER_CRASH: Final[str] = "recovered_after_crash"
+REASON_EXECUTION_TIMEOUT: Final[str] = "execution_timeout"
+DEFAULT_INFLIGHT_TIMEOUT_SECONDS: Final[int] = 120
 
 EVENT_INCIDENT_EXPIRED: Final[str] = "INCIDENT_EXPIRED"
 EVENT_INCIDENT_RECONCILED: Final[str] = "INCIDENT_RECONCILED"
@@ -55,6 +64,14 @@ class Lifecycle:
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS
     clock: Callable[[], datetime] = utc_now
     inflight_stale_seconds: int = 60
+    triage_timeout_seconds: int = DEFAULT_INFLIGHT_TIMEOUT_SECONDS
+    executing_timeout_seconds: int = DEFAULT_INFLIGHT_TIMEOUT_SECONDS
+    #: Resume a stale TRIAGING incident from its checkpoint. True = resumed and state synced.
+    resume_triage: Callable[[UUID], Awaitable[bool]] | None = None
+    #: Sends the coalesced summary page when one is due (Req 10.3). Runs once per tick.
+    flush_pages: Callable[[], Awaitable[object]] | None = None
+    #: Touched by ``run_reaper`` every iteration so ``/readyz`` can tell the reaper is alive.
+    heartbeat: ReaperHeartbeat | None = None
 
     async def handle_expiry(self, outcome: ExpiryOutcome, token: str) -> bool:
         """Run the expiry side effects for an incident the store just moved to ``EXPIRED``.
@@ -76,7 +93,7 @@ class Lifecycle:
             {"ttl_seconds": self.approval_ttl_seconds},
         )
         try:
-            await self.sms.send(f"INC-{token} no longer active. No action taken.")
+            await self.sms.send(f"INC-{token} EXPIRED. No action taken.")
         except Exception:
             logger.exception("expiry sms failed for %s", incident_id)
 
@@ -89,15 +106,91 @@ class Lifecycle:
             except Exception:
                 logger.exception("could not finish expiry of incident %s", item.incident_id)
         return len(stale)
+
+    async def sweep_inflight(self) -> int:
+        """Recover or fail ``TRIAGING``/``EXECUTING`` rows past their timeout (store clock).
+
+        ``TRIAGING``: claim (refresh ``updated_at``), try to resume from the checkpoint, and on
+        no checkpoint or any error compare-and-set ``TRIAGING`` -> ``FAILED``. ``EXECUTING``:
+        compare-and-set to ``FAILED``; the remediation step is never re-run. Returns the number
+        of incidents moved to ``FAILED``.
+        """
+        failed = 0
+        for item in await self.incidents.renew_stale_triaging(self.triage_timeout_seconds):
+            try:
+                if await self._try_resume(item.incident_id):
+                    continue
+                if not await self.incidents.compare_and_set_state(item.incident_id, "TRIAGING", "FAILED"):
+                    continue  # a concurrent writer moved it on; nothing to clean up
+                await self._apply_failure(item, REASON_RECOVERED_AFTER_CRASH)
+                failed += 1
+            except Exception:
+                logger.exception("could not recover triaging incident %s", item.incident_id)
+        for item in await self.incidents.fail_stale_state("EXECUTING", self.executing_timeout_seconds):
+            try:
+                await self._apply_failure(item, REASON_EXECUTION_TIMEOUT)
+                failed += 1
+            except Exception:
+                logger.exception("could not finish failure of incident %s", item.incident_id)
+        return failed
+
+    async def _try_resume(self, incident_id: UUID) -> bool:
+        if self.resume_triage is None:
+            return False
+        try:
+            return await asyncio.wait_for(self.resume_triage(incident_id), timeout=self.triage_timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("resume from checkpoint failed for %s", incident_id)
+            return False
+
+    async def _apply_failure(self, item: ReclaimedIncident, reason: str) -> None:
+        """Audit (no token/phone in payload), release the lock, tell the on-call engineer."""
+        await self._finish(
+            item.incident_id, item.service_name, item.error_code, "FAILED", EVENT_INCIDENT_FAILED,
+            {"reason": reason},
+        )
+        try:
+            await self.sms.send(f"INC-{item.token} FAILED. Re-send the alert.")
+        except Exception:
+            logger.exception("failure sms failed for %s", item.incident_id)
+
+    async def tick(self) -> None:
+        """One reaper iteration: approval expiry, in-flight sweep, summary page. Steps are isolated."""
+        try:
+            await self.reap_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("approval expiry sweep failed")
+        try:
+            await self.sweep_inflight()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("in-flight sweep failed")
+        if self.flush_pages is not None:
+            try:
+                await self.flush_pages()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("coalesced page flush failed")
+
     async def run_reaper(self, interval_seconds: float) -> None:
         """Loop until cancelled. A failing iteration is logged and the loop continues."""
         while True:
+            if self.heartbeat is not None:
+                self.heartbeat.beat()
             try:
-                await self.reap_once()
+                await self.tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("reaper iteration failed")
+            if self.heartbeat is not None:
+                self.heartbeat.beat()  # a slow tick must not look like a dead reaper
             await asyncio.sleep(interval_seconds)
 
     async def reconcile_orphans(self) -> int:
@@ -118,6 +211,10 @@ class Lifecycle:
                 await release_on_terminal(self.dedup, "FAILED", item.service_name, item.error_code, item.incident_id)
             except Exception:
                 logger.exception("could not release lock for %s", item.incident_id)
+            try:
+                await self.sms.send(f"INC-{item.token} FAILED. Re-send the alert.")
+            except Exception:
+                logger.exception("failure sms failed for %s", item.incident_id)
         return len(reclaimed)
 
     async def startup_reconcile(self, lock: ReconcileLock | None, worker_id: str = WORKER_ID) -> int | None:

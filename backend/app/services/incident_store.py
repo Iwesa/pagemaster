@@ -36,24 +36,51 @@ from backend.app.services.guardrails import (
 )
 
 IncidentStatus = Literal[
-    "TRIAGING", "AWAITING_APPROVAL", "EXECUTING", "RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED"
+    "TRIAGING",
+    "AWAITING_APPROVAL",
+    "EXECUTING",
+    "RESOLVED",
+    "BLOCKED_BY_TRIPWIRE",
+    "FAILED",
+    "EXPIRED",
+    "NO_ACTION",
 ]
+
+InflightStatus = Literal["TRIAGING", "EXECUTING"]
 
 ACTIVE_STATUSES: Final[frozenset[str]] = frozenset({"TRIAGING", "AWAITING_APPROVAL", "EXECUTING"})
 TERMINAL_STATUSES: Final[frozenset[str]] = frozenset(
-    {"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED"}
+    {"RESOLVED", "BLOCKED_BY_TRIPWIRE", "FAILED", "EXPIRED", "NO_ACTION"}
 )
 ALL_STATUSES: Final[frozenset[str]] = ACTIVE_STATUSES | TERMINAL_STATUSES
 
 #: Pseudo-incident that owns audit events with no incident (e.g. forged webhooks).
 SYSTEM_INCIDENT_ID: Final[UUID] = UUID(int=0)
 
-_TOKEN_ALPHABET: Final[str] = string.ascii_uppercase + string.digits
+TOKEN_ALPHABET: Final[str] = string.ascii_uppercase + string.digits
+DEFAULT_TOKEN_COOLDOWN_SECONDS: Final[int] = 3600
 
 
-def generate_token() -> str:
-    """Return a random 2-character uppercase alphanumeric token."""
-    return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(2))
+class TokenExhaustedError(Exception):
+    """Every token is held by an active incident or is still cooling down (Req 9.2)."""
+
+
+def token_space(alphabet: str = TOKEN_ALPHABET) -> list[str]:
+    """Every 2-character token over ``alphabet`` (36 x 36 = 1296 by default)."""
+    return [a + b for a in alphabet for b in alphabet]
+
+
+def generate_token(busy: Collection[str] = (), alphabet: str = TOKEN_ALPHABET) -> str:
+    """Draw uniformly from the tokens not in ``busy``.
+
+    Raises :class:`TokenExhaustedError` when none is free, so exhaustion is exact
+    instead of being guessed from failed random draws.
+    """
+    taken = set(busy)
+    free = [token for token in token_space(alphabet) if token not in taken]
+    if not free:
+        raise TokenExhaustedError
+    return secrets.choice(free)
 
 
 class TokenCollisionError(Exception):
@@ -79,8 +106,15 @@ class IncidentRecord(BaseModel):
     error_code: str
     state: IncidentStatus = "TRIAGING"
     raw_alert: dict[str, Any] = Field(default_factory=dict)
+    #: Reply options on the page (0..2), recorded with the state change that follows the
+    #: page; ``None`` until then (and for rows written before the column existed).
+    option_count: int | None = Field(default=None, ge=0, le=2)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    #: When the incident last entered a terminal state; ``None`` while active (Req 9.1).
+    terminal_at: datetime | None = None
+    #: Alerts deduplicated onto this incident (Req 10.5); audit rows are sampled, this is exact.
+    duplicate_count: int = Field(default=0, ge=0)
 
 
 class ReclaimedIncident(BaseModel):
@@ -182,6 +216,34 @@ class IncidentRepository(Protocol):
         """
         ...
 
+    async def fail_stale_state(
+        self, state: InflightStatus, timeout_seconds: float
+    ) -> list[ReclaimedIncident]:
+        """Compare-and-set ``state`` -> ``FAILED`` for rows with ``updated_at <= now - timeout_seconds``.
+
+        Store clock. Rows whose state changed concurrently are untouched.
+        """
+        ...
+
+    async def renew_stale_triaging(self, timeout_seconds: float) -> list[ReclaimedIncident]:
+        """Claim stale ``TRIAGING`` rows by refreshing ``updated_at`` (state unchanged).
+
+        Returns only the rows this caller claimed, so one worker per tick attempts recovery.
+        """
+        ...
+
+    async def latest_by_token(self, token: str) -> IncidentRecord | None:
+        """The newest incident (any state, system row excluded) that used ``token``."""
+        ...
+
+    async def busy_tokens(self, cooldown_seconds: float) -> frozenset[str]:
+        """Tokens that cannot be issued (Req 9.1).
+
+        Held by an active incident, or held by an incident that became terminal less
+        than ``cooldown_seconds`` ago (store clock).
+        """
+        ...
+
     async def expire_if_stale(self, token: str, ttl_seconds: float) -> ExpiryOutcome:
         """Point-of-use expiry check for the active incident holding ``token``.
 
@@ -191,10 +253,24 @@ class IncidentRepository(Protocol):
         """
         ...
 
+    async def increment_duplicate_count(self, incident_id: UUID) -> int | None:
+        """Atomically add one to the incident's duplicate counter and return the new value.
+
+        Independent of the incident's state (a concurrently terminal incident is counted
+        too). ``None`` if the incident does not exist.
+        """
+        ...
+
     async def record_resolution(
-        self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None
+        self,
+        incident_id: UUID,
+        status: IncidentStatus,
+        gates: ResolutionGates | None,
+        option_count: int | None = None,
     ) -> bool:
-        """Persist ``status`` and the four gate flags in one atomic write.
+        """Persist ``status``, the four gate flags and ``option_count`` in one atomic write.
+
+        ``option_count`` ``None`` keeps the stored value.
 
         ``None`` flags keep the stored value. ``RESOLVED`` is only accepted when
         every flag is true (``ValueError`` in memory, ``CheckViolationError`` in
@@ -305,11 +381,27 @@ class InMemoryIncidentRepository:
         ]
         return sorted(rows, key=lambda r: r.updated_at)[:limit]
 
+    @staticmethod
+    def _transition(new: IncidentStatus, now: datetime) -> dict[str, Any]:
+        """Fields written by a state change; ``terminal_at`` is set with the state (Req 9.1)."""
+        update: dict[str, Any] = {"state": new, "updated_at": now}
+        if new in TERMINAL_STATUSES:
+            update["terminal_at"] = now
+        return update
+
+    async def busy_tokens(self, cooldown_seconds: float) -> frozenset[str]:
+        cutoff = self._clock() - timedelta(seconds=cooldown_seconds)
+        return frozenset(
+            row.token
+            for row in self._rows.values()
+            if row.state in ACTIVE_STATUSES or (row.terminal_at is not None and row.terminal_at > cutoff)
+        )
+
     async def set_state(self, incident_id: UUID, new: IncidentStatus) -> bool:
         row = self._rows.get(incident_id)
         if row is None:
             return False
-        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": self._clock()})
+        self._rows[incident_id] = row.model_copy(update=self._transition(new, self._clock()))
         return True
 
     async def compare_and_set_state(
@@ -319,7 +411,7 @@ class InMemoryIncidentRepository:
         row = self._rows.get(incident_id)
         if row is None or row.state != expected:
             return False
-        self._rows[incident_id] = row.model_copy(update={"state": new, "updated_at": self._clock()})
+        self._rows[incident_id] = row.model_copy(update=self._transition(new, self._clock()))
         return True
 
     async def reconcile_stale_inflight(self, stale_seconds: int) -> list[ReclaimedIncident]:
@@ -329,7 +421,7 @@ class InMemoryIncidentRepository:
         reclaimed: list[ReclaimedIncident] = []
         for incident_id, row in list(self._rows.items()):
             if row.state in ("TRIAGING", "EXECUTING") and row.updated_at <= cutoff:
-                self._rows[incident_id] = row.model_copy(update={"state": "FAILED", "updated_at": now})
+                self._rows[incident_id] = row.model_copy(update=self._transition("FAILED", now))
                 reclaimed.append(
                     ReclaimedIncident(
                         incident_id=incident_id,
@@ -347,7 +439,7 @@ class InMemoryIncidentRepository:
         expired: list[ReclaimedIncident] = []
         for incident_id, row in list(self._rows.items()):
             if row.state == "AWAITING_APPROVAL" and row.updated_at <= cutoff:
-                self._rows[incident_id] = row.model_copy(update={"state": "EXPIRED", "updated_at": now})
+                self._rows[incident_id] = row.model_copy(update=self._transition("EXPIRED", now))
                 expired.append(
                     ReclaimedIncident(
                         incident_id=incident_id,
@@ -357,6 +449,42 @@ class InMemoryIncidentRepository:
                     )
                 )
         return expired
+
+    @staticmethod
+    def _reclaimed(row: IncidentRecord) -> ReclaimedIncident:
+        return ReclaimedIncident(
+            incident_id=row.incident_id,
+            token=row.token,
+            service_name=row.service_name,
+            error_code=row.error_code,
+        )
+
+    async def fail_stale_state(
+        self, state: InflightStatus, timeout_seconds: float
+    ) -> list[ReclaimedIncident]:
+        # No await between scan and write: atomic on the event loop.
+        now = self._clock()
+        cutoff = now - timedelta(seconds=timeout_seconds)
+        failed: list[ReclaimedIncident] = []
+        for incident_id, row in list(self._rows.items()):
+            if row.state == state and row.updated_at <= cutoff and incident_id != SYSTEM_INCIDENT_ID:
+                self._rows[incident_id] = row.model_copy(update=self._transition("FAILED", now))
+                failed.append(self._reclaimed(row))
+        return failed
+
+    async def renew_stale_triaging(self, timeout_seconds: float) -> list[ReclaimedIncident]:
+        now = self._clock()
+        cutoff = now - timedelta(seconds=timeout_seconds)
+        claimed: list[ReclaimedIncident] = []
+        for incident_id, row in list(self._rows.items()):
+            if row.state == "TRIAGING" and row.updated_at <= cutoff and incident_id != SYSTEM_INCIDENT_ID:
+                self._rows[incident_id] = row.model_copy(update={"updated_at": now})
+                claimed.append(self._reclaimed(row))
+        return claimed
+
+    async def latest_by_token(self, token: str) -> IncidentRecord | None:
+        rows = [r for r in self._rows.values() if r.token == token and r.incident_id != SYSTEM_INCIDENT_ID]
+        return max(rows, key=lambda r: r.created_at, default=None)
 
     async def expire_if_stale(self, token: str, ttl_seconds: float) -> ExpiryOutcome:
         # No await between read and write: atomic on the event loop.
@@ -369,7 +497,7 @@ class InMemoryIncidentRepository:
         is_expired = row.updated_at <= now - timedelta(seconds=ttl_seconds)
         expired_now = is_expired and row.state == "AWAITING_APPROVAL"
         if expired_now:
-            self._rows[row.incident_id] = row.model_copy(update={"state": "EXPIRED", "updated_at": now})
+            self._rows[row.incident_id] = row.model_copy(update=self._transition("EXPIRED", now))
         return ExpiryOutcome(
             found=True,
             incident_id=row.incident_id,
@@ -380,8 +508,21 @@ class InMemoryIncidentRepository:
             error_code=row.error_code,
         )
 
+    async def increment_duplicate_count(self, incident_id: UUID) -> int | None:
+        # No await between read and write: atomic on the event loop.
+        row = self._rows.get(incident_id)
+        if row is None:
+            return None
+        updated = row.model_copy(update={"duplicate_count": row.duplicate_count + 1})
+        self._rows[incident_id] = updated
+        return updated.duplicate_count
+
     async def record_resolution(
-        self, incident_id: UUID, status: IncidentStatus, gates: ResolutionGates | None
+        self,
+        incident_id: UUID,
+        status: IncidentStatus,
+        gates: ResolutionGates | None,
+        option_count: int | None = None,
     ) -> bool:
         row = self._rows.get(incident_id)
         if row is None:
@@ -393,7 +534,10 @@ class InMemoryIncidentRepository:
         if status == "RESOLVED" and not can_resolve(ResolutionGates.model_validate(merged)):
             raise ValueError("RESOLVED requires all four resolution gates to be true")
         self._gates[incident_id] = merged
-        self._rows[incident_id] = row.model_copy(update={"state": status, "updated_at": self._clock()})
+        update = self._transition(status, self._clock())
+        if option_count is not None:
+            update["option_count"] = option_count
+        self._rows[incident_id] = row.model_copy(update=update)
         return True
 
 

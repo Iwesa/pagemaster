@@ -11,6 +11,7 @@ Requirements: 2.1, 2.3, 5.3.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping, Sequence
 from typing import Final, Protocol
@@ -20,7 +21,10 @@ from backend.app.mcp.server import Confidence, IncidentContext
 
 logger = logging.getLogger("pagemaster.telemetry")
 
-#: Mirrors the seed rows of ``approved_runbooks`` in ``database/init_mock_logs.sql``.
+#: Per-call bound for the in-process telemetry source (the graph only bounds the whole triage).
+DATABASE_CALL_TIMEOUT_SECONDS: Final[float] = 5.0
+
+#: Mirrors the seed rows of ``approved_runbooks`` in ``database/30_demo_seed.sql``.
 SEED_RUNBOOKS: Final[Mapping[str, tuple[tuple[str, str], ...]]] = {
     "auth-db": (
         ("RB-AUTHDB-RESET-POOL", "Reset connection pool"),
@@ -85,7 +89,8 @@ class DatabaseTelemetry:
         self._source = source
 
     async def get_incident_context(self, service_name: str) -> TelemetryContext:
-        return to_telemetry_context(await self._source.get_incident_context(service_name))
+        async with asyncio.timeout(DATABASE_CALL_TIMEOUT_SECONDS):
+            return to_telemetry_context(await self._source.get_incident_context(service_name))
 
     async def list_approved(self, service_name: str) -> Sequence[Runbook]:
         return (await self.get_incident_context(service_name)).runbooks

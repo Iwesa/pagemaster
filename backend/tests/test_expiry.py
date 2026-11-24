@@ -137,7 +137,7 @@ async def test_reply_after_ttl_expires_without_mutation() -> None:
     assert graph.calls == []
     assert (await events_of(services, incident.incident_id))[-1] == "INCIDENT_EXPIRED"
     assert await fingerprint_free(services)
-    assert outbox(services) == ["INC-7A no longer active. No action taken."]
+    assert outbox(services) == ["INC-7A EXPIRED. No action taken."]
 
 
 async def test_reply_within_ttl_resolves() -> None:
@@ -339,7 +339,7 @@ async def test_expired_reply_audit_has_no_token_and_sends_single_sms() -> None:
     expired = [r for r in records if r.event_type == "INCIDENT_EXPIRED"]
     assert len(expired) == 1
     assert "7A" not in str(expired[0].payload) and "token" not in expired[0].payload
-    assert outbox(services) == ["INC-7A no longer active. No action taken."]
+    assert outbox(services) == ["INC-7A EXPIRED. No action taken."]
     assert graph.calls == []
 
 
@@ -365,7 +365,7 @@ def test_demo_reply_route_expires_through_same_path() -> None:
     assert asyncio.run(events_of(services, incident.incident_id))[-1] == "INCIDENT_EXPIRED"
     assert graph.calls == []
     assert asyncio.run(fingerprint_free(services))
-    assert outbox(services) == ["INC-7A no longer active. No action taken."]
+    assert outbox(services) == ["INC-7A EXPIRED. No action taken."]
 
 
 async def test_reaper_and_reply_share_side_effects_exactly_once() -> None:
@@ -376,7 +376,7 @@ async def test_reaper_and_reply_share_side_effects_exactly_once() -> None:
     await reply(services, "7A-1")  # already expired: informational only
     assert await services.lifecycle.reap_once() == 0
     assert (await events_of(services, incident.incident_id)).count("INCIDENT_EXPIRED") == 1
-    assert outbox(services)[0] == "INC-7A no longer active. No action taken."
+    assert outbox(services)[0] == "INC-7A EXPIRED. No action taken."
     assert graph.calls == []
     assert await fingerprint_free(services)
 
