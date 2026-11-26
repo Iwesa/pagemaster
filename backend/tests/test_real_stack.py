@@ -429,7 +429,16 @@ async def test_crash_recovery_kill_mid_triage_then_reaper_then_refire_is_accepte
                     return (await _incident(client, incident_id))["state"] == "RESOLVED"
 
                 await _eventually(resolved, 30.0, "the resumed incident to resolve")
-            refired = await client.post("/webhooks/alerts", json=alert)
+            # The terminal state commits before the fingerprint lock is released (audit first), so
+            # a refire right after observing it can still be DEDUPLICATED for a moment.
+            refired = httpx.Response(0)
+
+            async def refire_accepted() -> bool:
+                nonlocal refired
+                refired = await client.post("/webhooks/alerts", json=alert)
+                return refired.status_code != 202 or refired.json().get("status") != "DEDUPLICATED"
+
+            await _eventually(refire_accepted, 10.0, "the fingerprint lock to be released")
             assert refired.status_code == 202, refired.text
             assert refired.json()["incident_id"] != incident_id
     finally:
@@ -534,7 +543,19 @@ async def test_outage_returns_503_with_retry_after_then_recovers_without_restart
 
             await _eventually(answers_202, 60.0, "202 after the dependency returned")
             assert app.proc is not None and app.proc.poll() is None  # same process throughout
-            assert (await client.get("/readyz")).status_code == 200
+            # A reaper tick stalled on the dead dependency (or a stale pooled connection) can keep
+            # /readyz at 503 briefly after traffic recovers; it must converge without a restart.
+            last_ready: dict[str, Any] = {}
+
+            async def ready_again() -> bool:
+                resp = await client.get("/readyz")
+                last_ready["body"] = resp.text
+                return resp.status_code == 200
+
+            try:
+                await _eventually(ready_again, 60.0, "/readyz 200 after recovery")
+            except AssertionError as exc:
+                raise AssertionError(f"{exc}; last /readyz body: {last_ready.get('body')}") from None
     finally:
         app.stop()
         await proxy.stop()

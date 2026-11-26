@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -63,6 +65,12 @@ __all__ = [
     "build_real_services",
     "create_app",
 ]
+
+if sys.platform == "win32":
+    # psycopg's async driver (AsyncPostgresSaver) cannot run on Windows' default ProactorEventLoop.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logger = logging.getLogger("pagemaster.main")
 

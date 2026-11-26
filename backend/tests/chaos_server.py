@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from collections.abc import Sequence
 
 import uvicorn
@@ -37,6 +38,9 @@ def main() -> None:
         host="127.0.0.1",
         port=int(os.environ["PORT"]),
         log_level="warning",
+        # Windows: uvicorn's "asyncio"/"auto" loops are ProactorEventLoop (the event loop policy is
+        # ignored), which psycopg's async driver (AsyncPostgresSaver) cannot use.
+        loop="asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto",
     )
 
 

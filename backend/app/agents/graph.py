@@ -375,9 +375,27 @@ def build_graph(
 async def compile_with_postgres(
     conn_string: str, ports: Ports
 ) -> AsyncIterator[CompiledStateGraph[IncidentState, None, IncidentState, IncidentState]]:
-    """Compile the graph with an ``AsyncPostgresSaver`` (Req 4.1 durable checkpoints)."""
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # lazy: keeps imports light
+    """Compile the graph with an ``AsyncPostgresSaver`` (Req 4.1 durable checkpoints).
 
-    async with AsyncPostgresSaver.from_conn_string(conn_string) as saver:
+    The saver runs on a small connection pool, not a single connection: ``check`` validates a
+    connection on checkout, so connections broken by a Postgres network outage are discarded and
+    replaced without restarting the app.
+    """
+    # lazy: keeps imports light
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg import AsyncConnection
+    from psycopg.rows import DictRow, dict_row
+    from psycopg_pool import AsyncConnectionPool
+
+    async with AsyncConnectionPool[AsyncConnection[DictRow]](
+        conn_string,
+        open=False,
+        min_size=1,
+        max_size=4,
+        timeout=5.0,  # checkout fails fast during an outage instead of the 30 s default
+        check=AsyncConnectionPool.check_connection,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+    ) as pool:
+        saver = AsyncPostgresSaver(pool)
         await saver.setup()
         yield build_graph(ports, saver)

@@ -145,7 +145,12 @@ async def build_real_services(settings: Settings, stack: AsyncExitStack) -> Serv
     stack.push_async_callback(summarizer.aclose)
 
     async def ping_postgres() -> None:
-        await pool.fetchval("SELECT 1")
+        # After an outage, an idle pooled connection is dead until first use; asyncpg drops it on
+        # that failure. Retry once on a fresh connection so one stale eviction is not "down".
+        try:
+            await pool.fetchval("SELECT 1")
+        except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
+            await pool.fetchval("SELECT 1")
 
     async def ping_redis() -> None:
         await redis.ping()

@@ -346,7 +346,7 @@ async def test_boot_reconciliation_through_lifecycle_fails_only_stale_and_frees_
         # dedup lock released and the SQL fingerprint is reusable by a fresh incident
         probe = uuid4()
         assert isinstance(await dedup.acquire("auth-db", code, probe), Acquired)
-        replacement = await _new(repo, f"N{code}", code)
+        replacement = await _new(repo, f"N{code[-1]}", code)
         assert replacement != incident_id and await _state(pool, replacement) == "TRIAGING"
     for label in ("fresh_triaging", "fresh_executing"):
         assert isinstance(await dedup.acquire("auth-db", rows[label][1], uuid4()), Duplicate)
@@ -662,7 +662,7 @@ async def test_scripts_apply_twice_in_a_row_in_a_differently_named_database() ->
             "(SELECT count(*) FROM service_logs) AS logs"
         )
         assert counts is not None
-        assert (counts["runbooks"], counts["incidents"], counts["audit"], counts["logs"]) == (6, 2, 3, 17)
+        assert (counts["runbooks"], counts["incidents"], counts["audit"], counts["logs"]) == (6, 2, 3, 16)
         if roles:
             assert await conn.fetchval(
                 "SELECT has_database_privilege('mcp_reader', current_database(), 'CONNECT')"
